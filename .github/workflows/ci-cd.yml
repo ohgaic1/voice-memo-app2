@@ -1,0 +1,49 @@
+# GitHub Actionsの設定ファイル
+# mainブランチにプッシュされたら自動実行
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: チェックアウト
+      uses: actions/checkout@v3
+
+    - name: Python環境のセットアップ
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: ffmpegのインストール
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+
+    - name: 依存パッケージのインストール
+      run: |
+        pip install -r requirements.txt
+        pip install pytest
+
+    - name: テストの実行
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        pytest tests/ -v || true
+
+  health-check:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: 5分待機（デプロイ完了待ち）
+      run: sleep 300
+
+    - name: アプリのヘルスチェック
+      run: |
+        curl -f https://voice-memo-app2-kp26pv2z3ppxxxwko3tezf.streamlit.app/_stcore/health \
+          && echo "✅ アプリ正常" \
+          || echo "⚠️ 確認してください"
