@@ -24,6 +24,52 @@ if "results" not in st.session_state:
 
 
 # ═══════════════════════════════════════════
+# トークン制限対策：長いテキストを事前圧縮
+# ═══════════════════════════════════════════
+MAX_TRANSCRIPT_CHARS = 12000   # GPTに送る文字起こしの上限
+MAX_MATERIAL_CHARS   = 3000    # 資料テキストの上限
+MAX_REPORT_CHARS     = 4000    # サマリー生成時のレポートの上限
+
+
+def compress_transcript(text: str, api_key: str) -> str:
+    """
+    文字起こしが長すぎる場合、GPTで事前に要点を圧縮する。
+    圧縮後は MAX_TRANSCRIPT_CHARS 以内に収める。
+    """
+    if len(text) <= MAX_TRANSCRIPT_CHARS:
+        return text   # 短ければそのまま返す
+
+    client = OpenAI(api_key=api_key)
+    # 長い場合は先頭・中盤・末尾から均等にサンプリング
+    third = len(text) // 3
+    sampled = (
+        text[:4000] + "\n...(中略)...\n"
+        + text[third: third + 4000] + "\n...(中略)...\n"
+        + text[-4000:]
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",   # 圧縮はminiで十分
+            messages=[
+                {"role": "system", "content": "あなたは会議の内容を忠実に要約するアシスタントです。"},
+                {"role": "user", "content":
+                    f"以下の音声文字起こしを、重要な情報を落とさず8000文字以内に圧縮してください。"
+                    f"発言の流れ・決定事項・数値・固有名詞は必ず残してください。\n\n{sampled}"}
+            ],
+            temperature=0.2,
+            max_tokens=4000
+        )
+        compressed = resp.choices[0].message.content
+        st.info(f"📝 文字起こしを圧縮しました（{len(text):,}文字 → {len(compressed):,}文字）")
+        return compressed
+    except Exception:
+        # 圧縮失敗時はシンプルにカット
+        st.warning("⚠️ 圧縮に失敗したため先頭部分のみ使用します。")
+        return text[:MAX_TRANSCRIPT_CHARS]
+
+
+# ═══════════════════════════════════════════
 # 音声処理
 # ═══════════════════════════════════════════
 def compress_audio(input_path, output_path):
@@ -65,7 +111,6 @@ def split_audio(input_path, chunk_sec=600):
 
 
 def transcribe_audio(file_path, api_key):
-    """1ファイルを文字起こし（大容量対応）"""
     client = OpenAI(api_key=api_key)
     max_size = 24 * 1024 * 1024
     try:
@@ -172,36 +217,35 @@ def extract_material_text(uploaded_file):
 
 # ═══════════════════════════════════════════
 # GPT：Plaud風レポート
-# （複数ファイルの結合テキストを受け取る）
 # ═══════════════════════════════════════════
 def generate_report(combined_transcript, file_labels, material_text, api_key):
-    """
-    combined_transcript : 全ファイルを結合した文字起こし
-    file_labels         : ["file1.mp3", "file2.mp3", ...] ファイル名リスト
-    """
     client = OpenAI(api_key=api_key)
+
+    # ── 入力テキストを制限内に収める ──
+    safe_transcript = combined_transcript[:MAX_TRANSCRIPT_CHARS]
+    if len(combined_transcript) > MAX_TRANSCRIPT_CHARS:
+        st.info(f"📝 レポート生成のため文字起こしを {MAX_TRANSCRIPT_CHARS:,}文字に調整しました（元: {len(combined_transcript):,}文字）")
+
+    safe_material = ""
+    if material_text and material_text.strip():
+        safe_material = f"""
+---
+【補足資料】
+{material_text[:MAX_MATERIAL_CHARS]}
+---
+上記資料の数値・固有名詞・用語を積極的に活用してください。
+"""
 
     files_note = (
         f"※ 本レポートは以下 {len(file_labels)} 件の音声ファイルを統合した内容です：\n"
         + "\n".join(f"  - {l}" for l in file_labels)
-        if len(file_labels) > 1 else ""
-    )
-
-    mat = ""
-    if material_text and material_text.strip():
-        mat = f"""
----
-【補足資料】
-{material_text[:4000]}
----
-上記資料の数値・固有名詞・用語を積極的に活用してレポートを作成してください。
-"""
+    ) if len(file_labels) > 1 else ""
 
     prompt = f"""以下の音声文字起こしから詳細な構造化レポートを作成してください。
 {files_note}
-{mat}
-【文字起こし（全ファイル統合）】
-{combined_transcript}
+{safe_material}
+【文字起こし】
+{safe_transcript}
 
 # 📝 エグゼクティブサマリー
 （核心を捉えた2〜3段落。最重要な洞察・結論を含める）
@@ -239,10 +283,30 @@ def generate_report(combined_transcript, file_labels, material_text, api_key):
                 {"role": "system", "content": "あなたは音声メモから高品質な構造化レポートを作成する専門家です。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3
+            temperature=0.3,
+            max_tokens=3000
         )
         return resp.choices[0].message.content
     except Exception as e:
+        error_str = str(e)
+        if "rate_limit_exceeded" in error_str or "too large" in error_str.lower():
+            st.warning("⚠️ テキストが長すぎるため、さらに短縮して再試行します...")
+            # フォールバック：さらに短縮
+            short_transcript = combined_transcript[:6000]
+            try:
+                resp2 = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "あなたは音声メモから高品質な構造化レポートを作成する専門家です。"},
+                        {"role": "user", "content": prompt.replace(safe_transcript, short_transcript)}
+                    ],
+                    temperature=0.3,
+                    max_tokens=3000
+                )
+                return resp2.choices[0].message.content
+            except Exception as e2:
+                st.error(f"レポート生成エラー（再試行後）: {e2}")
+                return None
         st.error(f"レポート生成エラー: {e}")
         return None
 
@@ -252,14 +316,19 @@ def generate_report(combined_transcript, file_labels, material_text, api_key):
 # ═══════════════════════════════════════════
 def generate_summary_json(combined_transcript, report, material_text, api_key):
     client = OpenAI(api_key=api_key)
+
+    # ── 入力を制限 ──
+    safe_transcript = combined_transcript[:6000]
+    safe_report     = report[:MAX_REPORT_CHARS]
     mat_note = "補足資料の情報も反映してください。" if material_text else ""
+
     prompt = f"""以下の音声文字起こしとレポートから、構造化サマリーをJSON形式で作成してください。{mat_note}
 
 【文字起こし（抜粋）】
-{combined_transcript[:2500]}
+{safe_transcript}
 
 【レポート（抜粋）】
-{report[:3000]}
+{safe_report}
 
 以下のJSON構造で出力してください（日本語で）。
 コードブロック（```）は使わず、JSONのみを出力してください。
@@ -299,6 +368,7 @@ def generate_summary_json(combined_transcript, report, material_text, api_key):
 - concernsはリスク・懸念・未解決事項。なければ空配列[]
 - key_numbersは具体的な数値が言及された場合のみ。なければ空配列[]
 """
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -307,6 +377,7 @@ def generate_summary_json(combined_transcript, report, material_text, api_key):
                 {"role": "user", "content": prompt}
             ],
             temperature=0.2,
+            max_tokens=2000,
             response_format={"type": "json_object"}
         )
         return json.loads(resp.choices[0].message.content)
@@ -322,7 +393,6 @@ def summary_to_html(data, file_labels, generated_at):
     urgency_color = {"高": "#e53e5a", "中": "#f5a623", "低": "#22c38e"}.get(data.get("urgency", "中"), "#888")
     urgency_bg    = {"高": "#fff0f2", "中": "#fff8ee", "低": "#f0fff8"}.get(data.get("urgency", "中"), "#f5f5f5")
 
-    # フロー
     flow_items = data.get("flow", [])
     flow_html = ""
     for i, f in enumerate(flow_items):
@@ -336,14 +406,12 @@ def summary_to_html(data, file_labels, generated_at):
           </div>
         </div>{connector}"""
 
-    # 決定事項
     decisions = data.get("decisions", [])
     dec_html = "".join(
         f'<div class="card-item card-decision"><div class="card-item-title">✅ {d.get("title","")}</div><div class="card-item-detail">{d.get("detail","")}</div></div>'
         for d in decisions
     ) if decisions else '<div class="empty-note">言及なし</div>'
 
-    # アクション
     actions = data.get("actions", [])
     pc_map = {"高": "#e53e5a", "中": "#f5a623", "低": "#22c38e"}
     act_html = "".join(
@@ -357,33 +425,25 @@ def summary_to_html(data, file_labels, generated_at):
         for a in sorted(actions, key=lambda x: {"高":0,"中":1,"低":2}.get(x.get("priority","中"),1))
     ) if actions else '<div class="empty-note">言及なし</div>'
 
-    # 懸念
     concerns = data.get("concerns", [])
     con_html = "".join(
         f'<div class="card-item card-concern"><div class="card-item-title">⚠️ {c.get("title","")}</div><div class="card-item-detail">{c.get("detail","")}</div></div>'
         for c in concerns
     ) if concerns else '<div class="empty-note">言及なし</div>'
 
-    # 次回
     nexts = data.get("next_topics", [])
     next_html = "".join(f"<li>{n}</li>" for n in nexts) if nexts else '<li class="empty-note">言及なし</li>'
 
-    # 数値
     nums = data.get("key_numbers", [])
     num_html = "".join(
         f'<div class="kpi-card"><div class="kpi-value">{n.get("value","")}</div><div class="kpi-label">{n.get("label","")}</div></div>'
         for n in nums
     )
 
-    # キーワード
     keywords = data.get("keywords", [])
     kw_html = "".join(f'<span class="keyword">{k}</span>' for k in keywords)
-
-    # 参加者
     participants = data.get("participants", [])
     par_html = "・".join(participants) if participants else "不明"
-
-    # ファイル一覧
     files_html = "・".join(file_labels)
 
     return f"""<!DOCTYPE html>
@@ -459,37 +519,27 @@ body{{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--ink
     <div class="urgency-badge">{'🔴' if data.get('urgency')=='高' else '🟡' if data.get('urgency')=='中' else '🟢'} 緊急度：{data.get('urgency','中')}</div>
     <div class="files-note">📁 対象ファイル：{files_html}</div>
   </div>
-
   {"<div class='kpi-row'>" + num_html + "</div>" if nums else ""}
-
   <div class="section">
     <div class="section-title">📋 話の流れ・構成</div>
     <div class="flow-wrap">{flow_html}</div>
   </div>
-
   <div class="two-col">
     <div class="section">
-      <div class="section-title">✅ 決定事項</div>
-      {dec_html}
+      <div class="section-title">✅ 決定事項</div>{dec_html}
     </div>
     <div class="section">
-      <div class="section-title">⚠️ 懸念・リスク</div>
-      {con_html}
+      <div class="section-title">⚠️ 懸念・リスク</div>{con_html}
     </div>
   </div>
-
   <div class="section">
-    <div class="section-title">🎯 アクションアイテム</div>
-    {act_html}
+    <div class="section-title">🎯 アクションアイテム</div>{act_html}
   </div>
-
   <div class="section">
     <div class="section-title">🔄 次回以降の検討事項</div>
     <ul class="next-list">{next_html}</ul>
   </div>
-
   {"<div class='section'><div class='section-title'>🏷 キーワード</div><div class='keyword-wrap'>" + kw_html + "</div></div>" if keywords else ""}
-
   <div class="doc-footer">
     <div>📁 {files_html}</div>
     <div>🕐 生成日時：{generated_at}</div>
@@ -527,6 +577,9 @@ PDF / PPTX / DOCX
 | .txt | 文字起こし |
 | .md | 詳細レポート |
 | .html | 構造化サマリー |
+
+### ⚙️ トークン制限対策
+長い文字起こしは自動で調整して送信します。
 """)
 
 
@@ -540,32 +593,26 @@ if not st.session_state.api_key:
     st.warning("⚠️ サイドバーでOpenAI APIキーを設定してください")
     st.stop()
 
-# ════════════════════════════════
-# ③ アップロードエリア：縦並び
-# ════════════════════════════════
+# ── アップロードエリア（縦並び） ──
 st.subheader("🎵 音声ファイル（複数選択可）")
-st.caption("複数ファイルは自動的にファイル名順（作成日時順）で結合し、**1つのレポート**を作成します。")
+st.caption("複数ファイルはファイル名順（作成日時順）で結合し、**1つのレポート**を作成します。")
 audio_files = st.file_uploader(
     "MP3・WAV・M4A・WebM",
     type=["mp3", "wav", "m4a", "webm"],
-    accept_multiple_files=True,
-    help="ファイル名の数字順に自動整列して処理します。"
+    accept_multiple_files=True
 )
 
 st.markdown("---")
 
 st.subheader("📄 補足資料（任意・複数可）")
-st.caption("会議資料・スライドなど。アップロードするとレポートの精度が上がります。**なくても動作します。**")
+st.caption("会議資料・スライドなど。**なくても動作します。**")
 material_files = st.file_uploader(
     "PDF・PPTX・DOCX",
     type=["pdf", "pptx", "ppt", "docx", "doc"],
-    accept_multiple_files=True,
-    help="資料なしでも処理できます。"
+    accept_multiple_files=True
 )
 
-# ════════════════════════════════
-# ファイル確認表示
-# ════════════════════════════════
+# ── ファイル確認表示 ──
 if audio_files:
     def sort_key(f):
         nums = re.findall(r'\d+', f.name)
@@ -574,43 +621,40 @@ if audio_files:
     sorted_audio = sorted(audio_files, key=sort_key)
 
     st.markdown("---")
-
-    # 処理予定一覧
-    with st.expander(f"📋 処理予定：音声 {len(sorted_audio)}件（結合して1つのレポートを生成）", expanded=True):
-        total_mb = sum(f.size for f in sorted_audio) / (1024 * 1024)
+    with st.expander(
+        f"📋 処理予定：音声 {len(sorted_audio)}件（結合して1つのレポートを生成）",
+        expanded=True
+    ):
         for i, f in enumerate(sorted_audio, 1):
             mb = f.size / (1024 * 1024)
             c1, c2, c3 = st.columns([5, 2, 2])
             c1.write(f"**{i}.** {f.name}")
             c2.caption(f"{mb:.1f} MB")
             c3.caption("🔧 要圧縮" if mb > 24 else "✅ OK")
+        total_mb = sum(f.size for f in sorted_audio) / (1024 * 1024)
         st.caption(f"合計：{total_mb:.1f} MB")
-
         if len(sorted_audio) > 1:
-            st.info(f"💡 {len(sorted_audio)}件のファイルを順番に文字起こしし、**テキストを結合**してから1つのレポートを作成します。")
+            st.info(f"💡 {len(sorted_audio)}件を順番に文字起こし → テキスト結合 → 1本のレポートを生成します。")
 
     if material_files:
         st.info(f"📎 補足資料（{len(material_files)}件）: {', '.join(f.name for f in material_files)}")
     else:
         st.caption("📎 補足資料なし")
 
-    # ════════════════════════════════
-    # ② クリアボタン ＋ 処理開始ボタン
-    # ════════════════════════════════
     st.markdown("---")
-    btn_col1, btn_col2 = st.columns([1, 1])
+    btn_col1, btn_col2 = st.columns(2)
 
     with btn_col1:
         if st.button("🗑️ 処理結果をクリア", use_container_width=True):
             st.session_state.results = []
-            st.success("✅ クリアしました。新しいファイルを処理できます。")
+            st.success("✅ クリアしました。")
             st.rerun()
 
     with btn_col2:
         run = st.button("🚀 処理開始", type="primary", use_container_width=True)
 
     if run:
-        # ── 資料テキスト抽出 ──
+        # 資料抽出
         combined_material = None
         if material_files:
             with st.spinner("📄 補足資料を読み込み中..."):
@@ -625,25 +669,22 @@ if audio_files:
                 combined_material = "\n\n".join(mat_texts)
                 st.success(f"✅ 資料 {len(mat_texts)}件 読み込み完了")
 
-        # ════════════════════════════════
-        # ① 各ファイルを個別に文字起こし → 結合
-        # ════════════════════════════════
+        # ── ステップ1：文字起こし ──
         st.markdown("---")
         st.markdown("### 🎧 ステップ1：文字起こし")
 
-        transcripts_per_file = {}   # {filename: transcript}
+        transcripts_per_file = {}
         all_tmp_paths = []
 
         for idx, audio_file in enumerate(sorted_audio):
             st.markdown(f"**[{idx+1}/{len(sorted_audio)}]** {audio_file.name}")
-
             suffix = Path(audio_file.name).suffix
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
                 f.write(audio_file.read())
                 tmp_path = f.name
                 all_tmp_paths.append(tmp_path)
 
-            with st.spinner(f"  文字起こし中..."):
+            with st.spinner("  文字起こし中..."):
                 transcript = transcribe_audio(tmp_path, st.session_state.api_key)
 
             if transcript:
@@ -652,7 +693,6 @@ if audio_files:
             else:
                 st.error(f"  ❌ 失敗")
 
-        # 一時ファイル削除
         for p in all_tmp_paths:
             if os.path.exists(p):
                 os.remove(p)
@@ -661,24 +701,30 @@ if audio_files:
             st.error("文字起こしに成功したファイルがありません。")
             st.stop()
 
-        # ── テキストを結合（ファイル名セパレーター付き） ──
         file_labels = list(transcripts_per_file.keys())
 
+        # テキスト結合
         if len(file_labels) == 1:
-            combined_transcript = list(transcripts_per_file.values())[0]
+            raw_transcript = list(transcripts_per_file.values())[0]
         else:
             parts = []
             for fname, tr in transcripts_per_file.items():
                 parts.append(f"--- {fname} ---\n{tr}")
-            combined_transcript = "\n\n".join(parts)
+            raw_transcript = "\n\n".join(parts)
 
-        st.success(f"✅ {len(file_labels)}件 文字起こし完了（合計 {len(combined_transcript):,}文字）")
+        total_chars = len(raw_transcript)
+        st.success(f"✅ 文字起こし完了（合計 {total_chars:,}文字）")
 
-        # ════════════════════════════════
-        # レポート生成（結合テキストで1本）
-        # ════════════════════════════════
+        # ── トークン制限対策：長い場合は事前圧縮 ──
+        if total_chars > MAX_TRANSCRIPT_CHARS:
+            st.info(f"📝 テキストが長いため（{total_chars:,}文字）、要点を圧縮してからレポートを生成します...")
+            with st.spinner("圧縮中..."):
+                combined_transcript = compress_transcript(raw_transcript, st.session_state.api_key)
+        else:
+            combined_transcript = raw_transcript
+
+        # ── ステップ2：レポート生成 ──
         st.markdown("### 📊 ステップ2：統合レポート生成")
-
         with st.spinner("GPT-4o でレポート生成中..."):
             report = generate_report(
                 combined_transcript, file_labels, combined_material, st.session_state.api_key
@@ -688,12 +734,10 @@ if audio_files:
             st.error("レポート生成に失敗しました。")
             st.stop()
 
-        mat_note = "（資料補完あり）" if combined_material else ""
-        st.success(f"✅ レポート完了 {mat_note}")
+        st.success(f"✅ レポート完了{'（資料補完あり）' if combined_material else ''}")
 
-        # ── 構造化サマリー生成 ──
+        # ── ステップ3：構造化サマリー生成 ──
         st.markdown("### 📋 ステップ3：構造化サマリー生成")
-
         with st.spinner("構造化サマリー生成中..."):
             summary_data = generate_summary_json(
                 combined_transcript, report, combined_material, st.session_state.api_key
@@ -705,30 +749,25 @@ if audio_files:
             summary_html = summary_to_html(summary_data, file_labels, generated_at)
             st.success("✅ 構造化サマリー完了")
 
-        # ── 結果を保存 ──
+        # 結果保存
         result = {
             "label": "・".join(file_labels),
             "file_labels": file_labels,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "transcripts_per_file": transcripts_per_file,
-            "combined_transcript": combined_transcript,
+            "combined_transcript": raw_transcript,   # 元のフル文字起こしを保存
             "report": report,
             "summary_html": summary_html,
             "has_material": combined_material is not None
         }
-
         st.session_state.results = [result] + st.session_state.results
         st.balloons()
         st.success("🎉 処理完了！")
 
 
-# ════════════════════════════════
-# 結果表示
-# ════════════════════════════════
+# ── 結果表示 ──
 if st.session_state.results:
     st.markdown("---")
-
-    # クリアボタン（結果エリア上部にも配置）
     hcol1, hcol2 = st.columns([4, 1])
     hcol1.header(f"📋 処理結果（{len(st.session_state.results)}件）")
     if hcol2.button("🗑️ 全クリア", key="clear_top"):
@@ -739,9 +778,9 @@ if st.session_state.results:
         mat_badge = "  📎 資料補完あり" if result["has_material"] else ""
         n_files = len(result["file_labels"])
         header_label = (
-            f"📁 {result['label']}  —  {result['date']}{mat_badge}"
-            if n_files == 1
-            else f"📁 [{n_files}件統合] {result['label']}  —  {result['date']}{mat_badge}"
+            f"📁 [{n_files}件統合] {result['label']}  —  {result['date']}{mat_badge}"
+            if n_files > 1
+            else f"📁 {result['label']}  —  {result['date']}{mat_badge}"
         )
 
         with st.expander(header_label, expanded=True):
@@ -750,10 +789,9 @@ if st.session_state.results:
                 tab_labels.append("📋 構造化サマリー")
             tabs = st.tabs(tab_labels)
 
-            # 文字起こしタブ：ファイルごとに表示
+            # 文字起こし
             with tabs[0]:
                 if n_files > 1:
-                    # 複数ファイルの場合はサブタブで切り替え
                     sub_labels = list(result["transcripts_per_file"].keys()) + ["📄 全文（結合）"]
                     sub_tabs = st.tabs(sub_labels)
                     for i, (fname, tr) in enumerate(result["transcripts_per_file"].items()):
@@ -761,7 +799,7 @@ if st.session_state.results:
                             st.text_area("", tr, height=220,
                                          key=f"tr_{result['date']}_{fname}")
                             st.download_button(
-                                f"📥 {fname} 文字起こし (.txt)",
+                                f"📥 {fname} (.txt)",
                                 tr,
                                 file_name=f"transcript_{Path(fname).stem}.txt",
                                 mime="text/plain",
@@ -790,7 +828,7 @@ if st.session_state.results:
                         key=f"dtr_{result['date']}_{fname}"
                     )
 
-            # レポートタブ
+            # レポート
             with tabs[1]:
                 if result["report"]:
                     st.markdown(result["report"])
@@ -806,10 +844,10 @@ if st.session_state.results:
                         key=f"drp_{result['date']}"
                     )
 
-            # 構造化サマリータブ
+            # 構造化サマリー
             if result.get("summary_html") and len(tabs) > 2:
                 with tabs[2]:
-                    st.info("💡 「HTMLで保存」してブラウザで開くと、見やすく印刷・PDF化できます。")
+                    st.info("💡 HTMLをダウンロードしてブラウザで開くと、見やすく印刷・PDF化できます。")
                     fname_base = (
                         Path(result["file_labels"][0]).stem if n_files == 1
                         else f"combined_{result['date'].replace(':','').replace(' ','_')}"
