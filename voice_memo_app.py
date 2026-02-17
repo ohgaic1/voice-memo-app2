@@ -86,66 +86,99 @@ def compress_audio(input_path, output_path):
 
 
 def split_audio(input_path, chunk_sec=600):
+    """音声を10分チャンクに分割"""
     chunks = []
     try:
+        # 時間を取得
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
             capture_output=True, text=True, check=True
         )
         duration = float(probe.stdout.strip())
-        num = int(duration / chunk_sec) + 1
-        for i in range(num):
-            out = input_path.replace(Path(input_path).suffix, f"_chunk{i}.mp3")
+        num_chunks = int(duration / chunk_sec) + 1
+        
+        # 拡張子に関わらず.mp3で統一
+        base = os.path.splitext(input_path)[0]
+        
+        for i in range(num_chunks):
+            output_chunk = f"{base}_chunk{i}.mp3"
             subprocess.run(
                 ["ffmpeg", "-i", input_path,
                  "-ss", str(i * chunk_sec), "-t", str(chunk_sec),
-                 "-c", "copy", "-y", out],
+                 "-c", "copy", "-y", output_chunk],
                 check=True, capture_output=True
             )
-            if os.path.exists(out) and os.path.getsize(out) > 1000:
-                chunks.append(out)
+            if os.path.exists(output_chunk) and os.path.getsize(output_chunk) > 1000:
+                chunks.append(output_chunk)
+        
+        return chunks
     except Exception as e:
         st.error(f"分割エラー: {e}")
-    return chunks
+        return []
 
 
 def transcribe_audio(file_path, api_key):
+    """音声ファイルを文字起こし（大容量対応）"""
     client = OpenAI(api_key=api_key)
     max_size = 24 * 1024 * 1024
+    
     try:
+        # ファイルサイズチェック
+        size = os.path.getsize(file_path)
         work_path = file_path
-        if os.path.getsize(file_path) > max_size:
+        
+        # 圧縮が必要な場合
+        if size > max_size:
             st.info("  🔧 圧縮中...")
-            comp = file_path.replace(Path(file_path).suffix, "_comp.mp3")
+            # 拡張子を.mp3に統一
+            base = os.path.splitext(file_path)[0]
+            comp = f"{base}_comp.mp3"
             if not compress_audio(file_path, comp):
                 return None
             work_path = comp
-
-        if os.path.getsize(work_path) > max_size:
+            size = os.path.getsize(work_path)
+        
+        # まだ大きければ分割
+        if size > max_size:
             st.info("  ✂️ 分割中...")
             chunks = split_audio(work_path)
             if not chunks:
                 return None
+            
             texts = []
             pb = st.progress(0)
             for i, chunk in enumerate(chunks):
                 with open(chunk, "rb") as f:
-                    r = client.audio.transcriptions.create(
-                        model="whisper-1", file=f, language="ja")
-                    texts.append(r.text)
+                    resp = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        language="ja"
+                    )
+                    texts.append(resp.text)
                 pb.progress((i + 1) / len(chunks))
                 os.remove(chunk)
+            
+            # 圧縮ファイルを削除
             if work_path != file_path and os.path.exists(work_path):
                 os.remove(work_path)
+            
             return " ".join(texts).strip()
-
+        
+        # 通常サイズ → そのまま文字起こし
         with open(work_path, "rb") as f:
-            r = client.audio.transcriptions.create(
-                model="whisper-1", file=f, language="ja")
+            resp = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="ja"
+            )
+        
+        # 圧縮ファイルを削除
         if work_path != file_path and os.path.exists(work_path):
             os.remove(work_path)
-        return r.text
+        
+        return resp.text
+        
     except Exception as e:
         st.error(f"文字起こしエラー: {e}")
         return None
