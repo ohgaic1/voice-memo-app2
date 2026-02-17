@@ -65,19 +65,20 @@ def split_audio(input_path, chunk_sec=600):
 
 
 def transcribe_audio(file_path, api_key):
+    """1ファイルを文字起こし（大容量対応）"""
     client = OpenAI(api_key=api_key)
     max_size = 24 * 1024 * 1024
     try:
         work_path = file_path
         if os.path.getsize(file_path) > max_size:
-            st.info("🔧 圧縮中...")
+            st.info("  🔧 圧縮中...")
             comp = file_path.replace(Path(file_path).suffix, "_comp.mp3")
             if not compress_audio(file_path, comp):
                 return None
             work_path = comp
 
         if os.path.getsize(work_path) > max_size:
-            st.info("✂️ 分割中...")
+            st.info("  ✂️ 分割中...")
             chunks = split_audio(work_path)
             if not chunks:
                 return None
@@ -171,9 +172,21 @@ def extract_material_text(uploaded_file):
 
 # ═══════════════════════════════════════════
 # GPT：Plaud風レポート
+# （複数ファイルの結合テキストを受け取る）
 # ═══════════════════════════════════════════
-def generate_report(transcript, material_text, api_key):
+def generate_report(combined_transcript, file_labels, material_text, api_key):
+    """
+    combined_transcript : 全ファイルを結合した文字起こし
+    file_labels         : ["file1.mp3", "file2.mp3", ...] ファイル名リスト
+    """
     client = OpenAI(api_key=api_key)
+
+    files_note = (
+        f"※ 本レポートは以下 {len(file_labels)} 件の音声ファイルを統合した内容です：\n"
+        + "\n".join(f"  - {l}" for l in file_labels)
+        if len(file_labels) > 1 else ""
+    )
+
     mat = ""
     if material_text and material_text.strip():
         mat = f"""
@@ -183,10 +196,12 @@ def generate_report(transcript, material_text, api_key):
 ---
 上記資料の数値・固有名詞・用語を積極的に活用してレポートを作成してください。
 """
+
     prompt = f"""以下の音声文字起こしから詳細な構造化レポートを作成してください。
+{files_note}
 {mat}
-【文字起こし】
-{transcript}
+【文字起こし（全ファイル統合）】
+{combined_transcript}
 
 # 📝 エグゼクティブサマリー
 （核心を捉えた2〜3段落。最重要な洞察・結論を含める）
@@ -210,11 +225,10 @@ def generate_report(transcript, material_text, api_key):
 （今後の確認事項・未解決の問題・次のステップ）
 
 # 📌 メタ情報
-- 推定所要時間: [X分]
-- 主要参加者/話者: [推定]
-- 会議/メモのタイプ: [推定]
-- 緊急度: [高/中/低]
+- 音声ファイル数: {len(file_labels)}件
+- 対象ファイル: {', '.join(file_labels)}
 - 補足資料: {"あり（内容を反映済み）" if material_text else "なし"}
+- 緊急度: [高/中/低]
 
 ※文字起こしにない情報は「言及なし」と記載。"""
 
@@ -236,19 +250,13 @@ def generate_report(transcript, material_text, api_key):
 # ═══════════════════════════════════════════
 # GPT：構造化サマリー（JSON）
 # ═══════════════════════════════════════════
-def generate_summary_json(transcript, report, material_text, api_key):
-    """
-    GPT-4oにJSON形式で構造化サマリーを生成させる。
-    返り値: dict or None
-    """
+def generate_summary_json(combined_transcript, report, material_text, api_key):
     client = OpenAI(api_key=api_key)
-
     mat_note = "補足資料の情報も反映してください。" if material_text else ""
-
     prompt = f"""以下の音声文字起こしとレポートから、構造化サマリーをJSON形式で作成してください。{mat_note}
 
 【文字起こし（抜粋）】
-{transcript[:2500]}
+{combined_transcript[:2500]}
 
 【レポート（抜粋）】
 {report[:3000]}
@@ -270,16 +278,13 @@ def generate_summary_json(transcript, report, material_text, api_key):
     {{"time": "終盤", "topic": "トピック名", "summary": "内容の要約（30〜60文字）"}}
   ],
   "decisions": [
-    {{"title": "決定事項名", "detail": "詳細説明"}},
-    ...
+    {{"title": "決定事項名", "detail": "詳細説明"}}
   ],
   "actions": [
-    {{"priority": "高/中/低", "who": "担当者", "what": "タスク内容", "when": "期限"}},
-    ...
+    {{"priority": "高/中/低", "who": "担当者", "what": "タスク内容", "when": "期限"}}
   ],
   "concerns": [
-    {{"title": "懸念・リスク名", "detail": "詳細説明"}},
-    ...
+    {{"title": "懸念・リスク名", "detail": "詳細説明"}}
   ],
   "next_topics": ["次回以降の検討事項1", "次回以降の検討事項2"],
   "key_numbers": [
@@ -293,9 +298,7 @@ def generate_summary_json(transcript, report, material_text, api_key):
 - actionsは具体的なタスク。なければ空配列[]
 - concernsはリスク・懸念・未解決事項。なければ空配列[]
 - key_numbersは具体的な数値が言及された場合のみ。なければ空配列[]
-- 文字起こしにない情報は推測せず省略する
 """
-
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -306,23 +309,20 @@ def generate_summary_json(transcript, report, material_text, api_key):
             temperature=0.2,
             response_format={"type": "json_object"}
         )
-        raw = resp.choices[0].message.content
-        return json.loads(raw)
+        return json.loads(resp.choices[0].message.content)
     except Exception as e:
         st.error(f"構造化サマリー生成エラー: {e}")
         return None
 
 
 # ═══════════════════════════════════════════
-# 構造化サマリー → 美しいHTML
+# 構造化サマリー → HTML
 # ═══════════════════════════════════════════
-def summary_to_html(data, source_filename, generated_at):
-    """JSONデータから印刷対応の構造化サマリーHTMLを生成"""
-
+def summary_to_html(data, file_labels, generated_at):
     urgency_color = {"高": "#e53e5a", "中": "#f5a623", "低": "#22c38e"}.get(data.get("urgency", "中"), "#888")
     urgency_bg    = {"高": "#fff0f2", "中": "#fff8ee", "低": "#f0fff8"}.get(data.get("urgency", "中"), "#f5f5f5")
 
-    # ── フロー図 ──
+    # フロー
     flow_items = data.get("flow", [])
     flow_html = ""
     for i, f in enumerate(flow_items):
@@ -336,72 +336,55 @@ def summary_to_html(data, source_filename, generated_at):
           </div>
         </div>{connector}"""
 
-    # ── 決定事項 ──
+    # 決定事項
     decisions = data.get("decisions", [])
-    dec_html = ""
-    if decisions:
-        for d in decisions:
-            dec_html += f"""
-        <div class="card-item card-decision">
-          <div class="card-item-title">✅ {d.get('title','')}</div>
-          <div class="card-item-detail">{d.get('detail','')}</div>
-        </div>"""
-    else:
-        dec_html = '<div class="empty-note">言及なし</div>'
+    dec_html = "".join(
+        f'<div class="card-item card-decision"><div class="card-item-title">✅ {d.get("title","")}</div><div class="card-item-detail">{d.get("detail","")}</div></div>'
+        for d in decisions
+    ) if decisions else '<div class="empty-note">言及なし</div>'
 
-    # ── アクションアイテム ──
+    # アクション
     actions = data.get("actions", [])
-    act_html = ""
-    if actions:
-        priority_color = {"高": "#e53e5a", "中": "#f5a623", "低": "#22c38e"}
-        for a in sorted(actions, key=lambda x: {"高":0,"中":1,"低":2}.get(x.get("priority","中"),1)):
-            pc = priority_color.get(a.get("priority","中"), "#888")
-            act_html += f"""
-        <div class="action-row">
-          <span class="action-priority" style="background:{pc}20;color:{pc};border:1px solid {pc}40">{a.get('priority','')}</span>
+    pc_map = {"高": "#e53e5a", "中": "#f5a623", "低": "#22c38e"}
+    act_html = "".join(
+        f'''<div class="action-row">
+          <span class="action-priority" style="background:{pc_map.get(a.get("priority","中"),"#888")}20;color:{pc_map.get(a.get("priority","中"),"#888")};border:1px solid {pc_map.get(a.get("priority","中"),"#888")}40">{a.get("priority","")}</span>
           <div class="action-body">
-            <div class="action-what">{a.get('what','')}</div>
-            <div class="action-meta">👤 {a.get('who','未定')} &nbsp;｜&nbsp; 📅 {a.get('when','期限未定')}</div>
+            <div class="action-what">{a.get("what","")}</div>
+            <div class="action-meta">👤 {a.get("who","未定")} &nbsp;｜&nbsp; 📅 {a.get("when","期限未定")}</div>
           </div>
-        </div>"""
-    else:
-        act_html = '<div class="empty-note">言及なし</div>'
+        </div>'''
+        for a in sorted(actions, key=lambda x: {"高":0,"中":1,"低":2}.get(x.get("priority","中"),1))
+    ) if actions else '<div class="empty-note">言及なし</div>'
 
-    # ── 懸念・リスク ──
+    # 懸念
     concerns = data.get("concerns", [])
-    con_html = ""
-    if concerns:
-        for c in concerns:
-            con_html += f"""
-        <div class="card-item card-concern">
-          <div class="card-item-title">⚠️ {c.get('title','')}</div>
-          <div class="card-item-detail">{c.get('detail','')}</div>
-        </div>"""
-    else:
-        con_html = '<div class="empty-note">言及なし</div>'
+    con_html = "".join(
+        f'<div class="card-item card-concern"><div class="card-item-title">⚠️ {c.get("title","")}</div><div class="card-item-detail">{c.get("detail","")}</div></div>'
+        for c in concerns
+    ) if concerns else '<div class="empty-note">言及なし</div>'
 
-    # ── 次回検討事項 ──
+    # 次回
     nexts = data.get("next_topics", [])
-    next_html = "".join(f'<li>{n}</li>' for n in nexts) if nexts else '<li class="empty-note">言及なし</li>'
+    next_html = "".join(f"<li>{n}</li>" for n in nexts) if nexts else '<li class="empty-note">言及なし</li>'
 
-    # ── 数値データ ──
+    # 数値
     nums = data.get("key_numbers", [])
-    num_html = ""
-    if nums:
-        for n in nums:
-            num_html += f"""
-        <div class="kpi-card">
-          <div class="kpi-value">{n.get('value','')}</div>
-          <div class="kpi-label">{n.get('label','')}</div>
-        </div>"""
+    num_html = "".join(
+        f'<div class="kpi-card"><div class="kpi-value">{n.get("value","")}</div><div class="kpi-label">{n.get("label","")}</div></div>'
+        for n in nums
+    )
 
-    # ── キーワード ──
+    # キーワード
     keywords = data.get("keywords", [])
     kw_html = "".join(f'<span class="keyword">{k}</span>' for k in keywords)
 
-    # ── 参加者 ──
+    # 参加者
     participants = data.get("participants", [])
     par_html = "・".join(participants) if participants else "不明"
+
+    # ファイル一覧
+    files_html = "・".join(file_labels)
 
     return f"""<!DOCTYPE html>
 <html lang="ja">
@@ -411,356 +394,59 @@ def summary_to_html(data, source_filename, generated_at):
 <title>{data.get('title','構造化サマリー')}</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700;900&display=swap');
-
 :root {{
-  --ink:     #1a2140;
-  --ink2:    #4a567a;
-  --ink3:    #8892b0;
-  --line:    #e2e8f0;
-  --bg:      #f8faff;
-  --card:    #ffffff;
-  --blue:    #3b6ef0;
-  --blue-lt: #eef2ff;
-  --green:   #22c38e;
-  --red:     #e53e5a;
-  --amber:   #f5a623;
-  --radius:  10px;
-  --shadow:  0 2px 12px rgba(26,33,64,.08);
+  --ink:#1a2140;--ink2:#4a567a;--ink3:#8892b0;
+  --line:#e2e8f0;--bg:#f8faff;--card:#ffffff;
+  --blue:#3b6ef0;--blue-lt:#eef2ff;
+  --green:#22c38e;--red:#e53e5a;--amber:#f5a623;
+  --radius:10px;--shadow:0 2px 12px rgba(26,33,64,.08);
 }}
-
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-body {{
-  font-family: 'Noto Sans JP', sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-  font-size: 14px;
-  line-height: 1.7;
-  padding: 0;
-}}
-
-/* ── ページ wrapper ── */
-.page {{
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 40px 32px 80px;
-}}
-
-/* ── ヘッダー ── */
-.doc-header {{
-  border-bottom: 3px solid var(--blue);
-  padding-bottom: 24px;
-  margin-bottom: 32px;
-}}
-
-.doc-meta {{
-  display: flex;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}}
-
-.meta-chip {{
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .06em;
-  color: var(--ink3);
-  background: white;
-  border: 1px solid var(--line);
-  border-radius: 99px;
-  padding: 3px 11px;
-}}
-
-.doc-title {{
-  font-size: clamp(20px, 3vw, 28px);
-  font-weight: 900;
-  color: var(--ink);
-  line-height: 1.3;
-  margin-bottom: 12px;
-}}
-
-.one-line {{
-  font-size: 14px;
-  color: var(--ink2);
-  background: var(--blue-lt);
-  border-left: 4px solid var(--blue);
-  padding: 10px 16px;
-  border-radius: 0 8px 8px 0;
-  font-weight: 500;
-}}
-
-.urgency-badge {{
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 700;
-  padding: 4px 14px;
-  border-radius: 99px;
-  background: {urgency_bg};
-  color: {urgency_color};
-  border: 1.5px solid {urgency_color}40;
-  margin-top: 12px;
-}}
-
-/* ── KPIカード ── */
-.kpi-row {{
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin-bottom: 32px;
-}}
-
-.kpi-card {{
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 16px 20px;
-  min-width: 120px;
-  text-align: center;
-  box-shadow: var(--shadow);
-  flex: 1;
-}}
-
-.kpi-value {{
-  font-size: 22px;
-  font-weight: 900;
-  color: var(--blue);
-  line-height: 1.2;
-}}
-
-.kpi-label {{
-  font-size: 11px;
-  color: var(--ink3);
-  margin-top: 4px;
-}}
-
-/* ── セクション ── */
-.section {{
-  margin-bottom: 32px;
-}}
-
-.section-title {{
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--blue);
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}}
-
-.section-title::after {{
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: var(--line);
-}}
-
-/* ── フロー ── */
-.flow-wrap {{
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 0;
-}}
-
-.flow-item {{
-  display: flex;
-  gap: 16px;
-  align-items: flex-start;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 14px 18px;
-  width: 100%;
-  box-shadow: var(--shadow);
-}}
-
-.flow-arrow {{
-  text-align: center;
-  color: var(--ink3);
-  font-size: 18px;
-  padding: 4px 0;
-  width: 100%;
-}}
-
-.flow-time {{
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--blue);
-  background: var(--blue-lt);
-  padding: 3px 10px;
-  border-radius: 99px;
-  white-space: nowrap;
-  flex-shrink: 0;
-  align-self: flex-start;
-  margin-top: 2px;
-}}
-
-.flow-topic {{
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--ink);
-  margin-bottom: 4px;
-}}
-
-.flow-summary {{
-  font-size: 13px;
-  color: var(--ink2);
-}}
-
-/* ── カードアイテム ── */
-.card-item {{
-  background: var(--card);
-  border-radius: var(--radius);
-  padding: 14px 18px;
-  margin-bottom: 10px;
-  border: 1px solid var(--line);
-  box-shadow: var(--shadow);
-}}
-
-.card-decision {{ border-left: 4px solid var(--green); }}
-.card-concern  {{ border-left: 4px solid var(--amber); }}
-
-.card-item-title {{
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--ink);
-  margin-bottom: 4px;
-}}
-
-.card-item-detail {{
-  font-size: 13px;
-  color: var(--ink2);
-}}
-
-/* ── アクションアイテム ── */
-.action-row {{
-  display: flex;
-  gap: 14px;
-  align-items: flex-start;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px 16px;
-  margin-bottom: 8px;
-  box-shadow: var(--shadow);
-}}
-
-.action-priority {{
-  font-size: 11px;
-  font-weight: 700;
-  padding: 3px 10px;
-  border-radius: 99px;
-  white-space: nowrap;
-  flex-shrink: 0;
-}}
-
-.action-what {{
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--ink);
-  margin-bottom: 4px;
-}}
-
-.action-meta {{
-  font-size: 12px;
-  color: var(--ink3);
-}}
-
-/* ── 次回検討 ── */
-.next-list {{
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}}
-
-.next-list li {{
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 10px 16px;
-  font-size: 13px;
-  color: var(--ink2);
-  box-shadow: var(--shadow);
-}}
-
-.next-list li::before {{ content: "→ "; color: var(--blue); font-weight: 700; }}
-
-/* ── キーワード ── */
-.keyword-wrap {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-
-.keyword {{
-  background: var(--blue-lt);
-  color: var(--blue);
-  border: 1px solid #c0cef8;
-  border-radius: 99px;
-  padding: 4px 14px;
-  font-size: 12px;
-  font-weight: 600;
-}}
-
-/* ── 参加者 ── */
-.participant-bar {{
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px 16px;
-  font-size: 13px;
-  color: var(--ink2);
-  box-shadow: var(--shadow);
-}}
-
-.empty-note {{
-  font-size: 13px;
-  color: var(--ink3);
-  font-style: italic;
-  padding: 8px 4px;
-}}
-
-/* ── フッター ── */
-.doc-footer {{
-  margin-top: 48px;
-  padding-top: 16px;
-  border-top: 1px solid var(--line);
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--ink3);
-}}
-
-/* ── 2カラムレイアウト ── */
-.two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
-
-@media (max-width: 600px) {{
-  .page {{ padding: 24px 16px 60px; }}
-  .two-col {{ grid-template-columns: 1fr; }}
-}}
-
-/* ── 印刷 ── */
-@media print {{
-  body {{ background: white; }}
-  .page {{ padding: 20px; max-width: 100%; }}
-  .card-item, .action-row, .flow-item, .next-list li {{
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-    break-inside: avoid;
-  }}
-  .section {{ break-inside: avoid; }}
-}}
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--ink);font-size:14px;line-height:1.7;}}
+.page{{max-width:860px;margin:0 auto;padding:40px 32px 80px;}}
+.doc-header{{border-bottom:3px solid var(--blue);padding-bottom:24px;margin-bottom:32px;}}
+.doc-meta{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;}}
+.meta-chip{{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--ink3);background:white;border:1px solid var(--line);border-radius:99px;padding:3px 11px;}}
+.doc-title{{font-size:clamp(20px,3vw,28px);font-weight:900;color:var(--ink);line-height:1.3;margin-bottom:12px;}}
+.one-line{{font-size:14px;color:var(--ink2);background:var(--blue-lt);border-left:4px solid var(--blue);padding:10px 16px;border-radius:0 8px 8px 0;font-weight:500;}}
+.urgency-badge{{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:700;padding:4px 14px;border-radius:99px;background:{urgency_bg};color:{urgency_color};border:1.5px solid {urgency_color}40;margin-top:12px;}}
+.kpi-row{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:32px;}}
+.kpi-card{{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 20px;min-width:120px;text-align:center;box-shadow:var(--shadow);flex:1;}}
+.kpi-value{{font-size:22px;font-weight:900;color:var(--blue);line-height:1.2;}}
+.kpi-label{{font-size:11px;color:var(--ink3);margin-top:4px;}}
+.section{{margin-bottom:32px;}}
+.section-title{{font-size:11px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--blue);margin-bottom:12px;display:flex;align-items:center;gap:8px;}}
+.section-title::after{{content:'';flex:1;height:1px;background:var(--line);}}
+.flow-wrap{{display:flex;flex-direction:column;}}
+.flow-item{{display:flex;gap:16px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:14px 18px;width:100%;box-shadow:var(--shadow);}}
+.flow-arrow{{text-align:center;color:var(--ink3);font-size:18px;padding:4px 0;}}
+.flow-time{{font-size:11px;font-weight:700;color:var(--blue);background:var(--blue-lt);padding:3px 10px;border-radius:99px;white-space:nowrap;flex-shrink:0;align-self:flex-start;margin-top:2px;}}
+.flow-topic{{font-size:14px;font-weight:700;color:var(--ink);margin-bottom:4px;}}
+.flow-summary{{font-size:13px;color:var(--ink2);}}
+.card-item{{background:var(--card);border-radius:var(--radius);padding:14px 18px;margin-bottom:10px;border:1px solid var(--line);box-shadow:var(--shadow);}}
+.card-decision{{border-left:4px solid var(--green);}}
+.card-concern{{border-left:4px solid var(--amber);}}
+.card-item-title{{font-size:14px;font-weight:700;color:var(--ink);margin-bottom:4px;}}
+.card-item-detail{{font-size:13px;color:var(--ink2);}}
+.action-row{{display:flex;gap:14px;align-items:flex-start;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:12px 16px;margin-bottom:8px;box-shadow:var(--shadow);}}
+.action-priority{{font-size:11px;font-weight:700;padding:3px 10px;border-radius:99px;white-space:nowrap;flex-shrink:0;}}
+.action-what{{font-size:14px;font-weight:600;color:var(--ink);margin-bottom:4px;}}
+.action-meta{{font-size:12px;color:var(--ink3);}}
+.next-list{{list-style:none;display:flex;flex-direction:column;gap:8px;}}
+.next-list li{{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:10px 16px;font-size:13px;color:var(--ink2);box-shadow:var(--shadow);}}
+.next-list li::before{{content:"→ ";color:var(--blue);font-weight:700;}}
+.keyword-wrap{{display:flex;flex-wrap:wrap;gap:8px;}}
+.keyword{{background:var(--blue-lt);color:var(--blue);border:1px solid #c0cef8;border-radius:99px;padding:4px 14px;font-size:12px;font-weight:600;}}
+.two-col{{display:grid;grid-template-columns:1fr 1fr;gap:24px;}}
+.empty-note{{font-size:13px;color:var(--ink3);font-style:italic;padding:8px 4px;}}
+.doc-footer{{margin-top:48px;padding-top:16px;border-top:1px solid var(--line);font-size:11px;color:var(--ink3);}}
+.files-note{{font-size:12px;color:var(--ink3);margin-top:4px;}}
+@media(max-width:600px){{.page{{padding:24px 16px 60px;}}.two-col{{grid-template-columns:1fr;}}}}
+@media print{{body{{background:white;}}.page{{padding:20px;max-width:100%;}}.card-item,.action-row,.flow-item,.next-list li{{-webkit-print-color-adjust:exact;print-color-adjust:exact;break-inside:avoid;}}.section{{break-inside:avoid;}}}}
 </style>
 </head>
 <body>
 <div class="page">
-
-  <!-- ヘッダー -->
   <div class="doc-header">
     <div class="doc-meta">
       <span class="meta-chip">📅 {data.get('date','不明')}</span>
@@ -771,18 +457,16 @@ body {{
     <div class="doc-title">{data.get('title','構造化サマリー')}</div>
     <div class="one-line">{data.get('one_line','')}</div>
     <div class="urgency-badge">{'🔴' if data.get('urgency')=='高' else '🟡' if data.get('urgency')=='中' else '🟢'} 緊急度：{data.get('urgency','中')}</div>
+    <div class="files-note">📁 対象ファイル：{files_html}</div>
   </div>
 
-  <!-- KPI数値（あれば） -->
   {"<div class='kpi-row'>" + num_html + "</div>" if nums else ""}
 
-  <!-- 話の流れ -->
   <div class="section">
     <div class="section-title">📋 話の流れ・構成</div>
     <div class="flow-wrap">{flow_html}</div>
   </div>
 
-  <!-- 決定事項 ＆ 懸念・リスク -->
   <div class="two-col">
     <div class="section">
       <div class="section-title">✅ 決定事項</div>
@@ -794,27 +478,22 @@ body {{
     </div>
   </div>
 
-  <!-- アクションアイテム -->
   <div class="section">
     <div class="section-title">🎯 アクションアイテム</div>
     {act_html}
   </div>
 
-  <!-- 次回以降の検討事項 -->
   <div class="section">
     <div class="section-title">🔄 次回以降の検討事項</div>
     <ul class="next-list">{next_html}</ul>
   </div>
 
-  <!-- キーワード -->
   {"<div class='section'><div class='section-title'>🏷 キーワード</div><div class='keyword-wrap'>" + kw_html + "</div></div>" if keywords else ""}
 
-  <!-- フッター -->
   <div class="doc-footer">
-    <span>📁 {source_filename}</span>
-    <span>🕐 生成日時：{generated_at}</span>
+    <div>📁 {files_html}</div>
+    <div>🕐 生成日時：{generated_at}</div>
   </div>
-
 </div>
 </body>
 </html>"""
@@ -843,7 +522,7 @@ MP3 / WAV / M4A / WebM
 PDF / PPTX / DOCX
 
 ### 📤 出力ファイル
-| ファイル | 内容 |
+| | 内容 |
 |---|---|
 | .txt | 文字起こし |
 | .md | 詳細レポート |
@@ -855,34 +534,38 @@ PDF / PPTX / DOCX
 # UI：メイン
 # ═══════════════════════════════════════════
 st.title("🎙️ 音声メモアプリ Pro")
-st.caption("複数ファイル対応 ／ PDF・PPTX補完 ／ Plaud風レポート ／ 構造化サマリー（印刷対応HTML）")
+st.caption("複数ファイル → 統合レポート ／ PDF・PPTX補完 ／ Plaud風レポート ／ 構造化サマリー")
 
 if not st.session_state.api_key:
     st.warning("⚠️ サイドバーでOpenAI APIキーを設定してください")
     st.stop()
 
-# ── アップロードエリア ──
-col1, col2 = st.columns([3, 2])
+# ════════════════════════════════
+# ③ アップロードエリア：縦並び
+# ════════════════════════════════
+st.subheader("🎵 音声ファイル（複数選択可）")
+st.caption("複数ファイルは自動的にファイル名順（作成日時順）で結合し、**1つのレポート**を作成します。")
+audio_files = st.file_uploader(
+    "MP3・WAV・M4A・WebM",
+    type=["mp3", "wav", "m4a", "webm"],
+    accept_multiple_files=True,
+    help="ファイル名の数字順に自動整列して処理します。"
+)
 
-with col1:
-    st.subheader("🎵 音声ファイル（複数選択可）")
-    audio_files = st.file_uploader(
-        "MP3・WAV・M4A・WebM",
-        type=["mp3", "wav", "m4a", "webm"],
-        accept_multiple_files=True,
-        help="ファイル名の数字順（作成日時順）に自動整列して処理します。"
-    )
+st.markdown("---")
 
-with col2:
-    st.subheader("📄 補足資料（任意）")
-    st.caption("会議資料・スライドなど。なくても動作します。")
-    material_files = st.file_uploader(
-        "PDF・PPTX・DOCX",
-        type=["pdf", "pptx", "ppt", "docx", "doc"],
-        accept_multiple_files=True
-    )
+st.subheader("📄 補足資料（任意・複数可）")
+st.caption("会議資料・スライドなど。アップロードするとレポートの精度が上がります。**なくても動作します。**")
+material_files = st.file_uploader(
+    "PDF・PPTX・DOCX",
+    type=["pdf", "pptx", "ppt", "docx", "doc"],
+    accept_multiple_files=True,
+    help="資料なしでも処理できます。"
+)
 
-# ── ファイル確認 ──
+# ════════════════════════════════
+# ファイル確認表示
+# ════════════════════════════════
 if audio_files:
     def sort_key(f):
         nums = re.findall(r'\d+', f.name)
@@ -891,24 +574,43 @@ if audio_files:
     sorted_audio = sorted(audio_files, key=sort_key)
 
     st.markdown("---")
-    with st.expander(f"📋 処理予定：音声 {len(sorted_audio)}件", expanded=True):
+
+    # 処理予定一覧
+    with st.expander(f"📋 処理予定：音声 {len(sorted_audio)}件（結合して1つのレポートを生成）", expanded=True):
+        total_mb = sum(f.size for f in sorted_audio) / (1024 * 1024)
         for i, f in enumerate(sorted_audio, 1):
             mb = f.size / (1024 * 1024)
             c1, c2, c3 = st.columns([5, 2, 2])
             c1.write(f"**{i}.** {f.name}")
             c2.caption(f"{mb:.1f} MB")
             c3.caption("🔧 要圧縮" if mb > 24 else "✅ OK")
+        st.caption(f"合計：{total_mb:.1f} MB")
+
+        if len(sorted_audio) > 1:
+            st.info(f"💡 {len(sorted_audio)}件のファイルを順番に文字起こしし、**テキストを結合**してから1つのレポートを作成します。")
 
     if material_files:
         st.info(f"📎 補足資料（{len(material_files)}件）: {', '.join(f.name for f in material_files)}")
     else:
         st.caption("📎 補足資料なし")
 
+    # ════════════════════════════════
+    # ② クリアボタン ＋ 処理開始ボタン
+    # ════════════════════════════════
     st.markdown("---")
-    run = st.button("🚀 処理開始", type="primary", use_container_width=True)
+    btn_col1, btn_col2 = st.columns([1, 1])
+
+    with btn_col1:
+        if st.button("🗑️ 処理結果をクリア", use_container_width=True):
+            st.session_state.results = []
+            st.success("✅ クリアしました。新しいファイルを処理できます。")
+            st.rerun()
+
+    with btn_col2:
+        run = st.button("🚀 処理開始", type="primary", use_container_width=True)
 
     if run:
-        # 資料テキスト抽出
+        # ── 資料テキスト抽出 ──
         combined_material = None
         if material_files:
             with st.spinner("📄 補足資料を読み込み中..."):
@@ -923,119 +625,202 @@ if audio_files:
                 combined_material = "\n\n".join(mat_texts)
                 st.success(f"✅ 資料 {len(mat_texts)}件 読み込み完了")
 
-        new_results = []
-        for idx, audio_file in enumerate(sorted_audio):
-            st.markdown(f"---")
-            st.markdown(f"**[{idx+1}/{len(sorted_audio)}]** {audio_file.name}")
+        # ════════════════════════════════
+        # ① 各ファイルを個別に文字起こし → 結合
+        # ════════════════════════════════
+        st.markdown("---")
+        st.markdown("### 🎧 ステップ1：文字起こし")
 
-            result = {
-                "filename": audio_file.name,
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "transcript": None,
-                "report": None,
-                "summary_html": None,
-                "has_material": combined_material is not None
-            }
+        transcripts_per_file = {}   # {filename: transcript}
+        all_tmp_paths = []
+
+        for idx, audio_file in enumerate(sorted_audio):
+            st.markdown(f"**[{idx+1}/{len(sorted_audio)}]** {audio_file.name}")
 
             suffix = Path(audio_file.name).suffix
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
                 f.write(audio_file.read())
                 tmp_path = f.name
+                all_tmp_paths.append(tmp_path)
 
-            try:
-                # 1. 文字起こし
-                with st.spinner("🎧 文字起こし中..."):
-                    transcript = transcribe_audio(tmp_path, st.session_state.api_key)
-                if not transcript:
-                    st.error(f"❌ 文字起こし失敗")
-                    continue
-                result["transcript"] = transcript
-                st.success(f"✅ 文字起こし完了（{len(transcript):,}文字）")
+            with st.spinner(f"  文字起こし中..."):
+                transcript = transcribe_audio(tmp_path, st.session_state.api_key)
 
-                # 2. レポート生成
-                with st.spinner("📊 レポート生成中 (GPT-4o)..."):
-                    report = generate_report(transcript, combined_material, st.session_state.api_key)
-                if report:
-                    result["report"] = report
-                    st.success(f"✅ レポート完了{'（資料補完あり）' if combined_material else ''}")
+            if transcript:
+                transcripts_per_file[audio_file.name] = transcript
+                st.success(f"  ✅ 完了（{len(transcript):,}文字）")
+            else:
+                st.error(f"  ❌ 失敗")
 
-                # 3. 構造化サマリー生成
-                if report:
-                    with st.spinner("📋 構造化サマリー生成中..."):
-                        summary_data = generate_summary_json(
-                            transcript, report, combined_material, st.session_state.api_key
-                        )
-                    if summary_data:
-                        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        result["summary_html"] = summary_to_html(
-                            summary_data, audio_file.name, generated_at
-                        )
-                        st.success("✅ 構造化サマリー完了")
+        # 一時ファイル削除
+        for p in all_tmp_paths:
+            if os.path.exists(p):
+                os.remove(p)
 
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+        if not transcripts_per_file:
+            st.error("文字起こしに成功したファイルがありません。")
+            st.stop()
 
-            new_results.append(result)
+        # ── テキストを結合（ファイル名セパレーター付き） ──
+        file_labels = list(transcripts_per_file.keys())
 
-        st.session_state.results = new_results + st.session_state.results
+        if len(file_labels) == 1:
+            combined_transcript = list(transcripts_per_file.values())[0]
+        else:
+            parts = []
+            for fname, tr in transcripts_per_file.items():
+                parts.append(f"--- {fname} ---\n{tr}")
+            combined_transcript = "\n\n".join(parts)
+
+        st.success(f"✅ {len(file_labels)}件 文字起こし完了（合計 {len(combined_transcript):,}文字）")
+
+        # ════════════════════════════════
+        # レポート生成（結合テキストで1本）
+        # ════════════════════════════════
+        st.markdown("### 📊 ステップ2：統合レポート生成")
+
+        with st.spinner("GPT-4o でレポート生成中..."):
+            report = generate_report(
+                combined_transcript, file_labels, combined_material, st.session_state.api_key
+            )
+
+        if not report:
+            st.error("レポート生成に失敗しました。")
+            st.stop()
+
+        mat_note = "（資料補完あり）" if combined_material else ""
+        st.success(f"✅ レポート完了 {mat_note}")
+
+        # ── 構造化サマリー生成 ──
+        st.markdown("### 📋 ステップ3：構造化サマリー生成")
+
+        with st.spinner("構造化サマリー生成中..."):
+            summary_data = generate_summary_json(
+                combined_transcript, report, combined_material, st.session_state.api_key
+            )
+
+        summary_html = None
+        if summary_data:
+            generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+            summary_html = summary_to_html(summary_data, file_labels, generated_at)
+            st.success("✅ 構造化サマリー完了")
+
+        # ── 結果を保存 ──
+        result = {
+            "label": "・".join(file_labels),
+            "file_labels": file_labels,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "transcripts_per_file": transcripts_per_file,
+            "combined_transcript": combined_transcript,
+            "report": report,
+            "summary_html": summary_html,
+            "has_material": combined_material is not None
+        }
+
+        st.session_state.results = [result] + st.session_state.results
         st.balloons()
-        st.success(f"🎉 {len(new_results)}件 処理完了！")
+        st.success("🎉 処理完了！")
 
 
-# ── 結果表示 ──
+# ════════════════════════════════
+# 結果表示
+# ════════════════════════════════
 if st.session_state.results:
     st.markdown("---")
-    st.header(f"📋 処理結果（{len(st.session_state.results)}件）")
+
+    # クリアボタン（結果エリア上部にも配置）
+    hcol1, hcol2 = st.columns([4, 1])
+    hcol1.header(f"📋 処理結果（{len(st.session_state.results)}件）")
+    if hcol2.button("🗑️ 全クリア", key="clear_top"):
+        st.session_state.results = []
+        st.rerun()
 
     for result in st.session_state.results:
         mat_badge = "  📎 資料補完あり" if result["has_material"] else ""
-        with st.expander(
-            f"📁 {result['filename']}  —  {result['date']}{mat_badge}",
-            expanded=True
-        ):
+        n_files = len(result["file_labels"])
+        header_label = (
+            f"📁 {result['label']}  —  {result['date']}{mat_badge}"
+            if n_files == 1
+            else f"📁 [{n_files}件統合] {result['label']}  —  {result['date']}{mat_badge}"
+        )
+
+        with st.expander(header_label, expanded=True):
             tab_labels = ["📄 文字起こし", "📊 レポート"]
             if result.get("summary_html"):
                 tab_labels.append("📋 構造化サマリー")
             tabs = st.tabs(tab_labels)
 
-            # 文字起こし
+            # 文字起こしタブ：ファイルごとに表示
             with tabs[0]:
-                if result["transcript"]:
-                    st.text_area("", result["transcript"], height=250,
-                                 key=f"tr_{result['filename']}_{result['date']}")
+                if n_files > 1:
+                    # 複数ファイルの場合はサブタブで切り替え
+                    sub_labels = list(result["transcripts_per_file"].keys()) + ["📄 全文（結合）"]
+                    sub_tabs = st.tabs(sub_labels)
+                    for i, (fname, tr) in enumerate(result["transcripts_per_file"].items()):
+                        with sub_tabs[i]:
+                            st.text_area("", tr, height=220,
+                                         key=f"tr_{result['date']}_{fname}")
+                            st.download_button(
+                                f"📥 {fname} 文字起こし (.txt)",
+                                tr,
+                                file_name=f"transcript_{Path(fname).stem}.txt",
+                                mime="text/plain",
+                                key=f"dtr_{result['date']}_{fname}"
+                            )
+                    with sub_tabs[-1]:
+                        st.text_area("", result["combined_transcript"], height=300,
+                                     key=f"tr_all_{result['date']}")
+                        st.download_button(
+                            "📥 全文字起こし（結合）(.txt)",
+                            result["combined_transcript"],
+                            file_name=f"transcript_combined_{result['date'].replace(':','').replace(' ','_')}.txt",
+                            mime="text/plain",
+                            key=f"dtr_all_{result['date']}"
+                        )
+                else:
+                    fname = result["file_labels"][0]
+                    tr = result["transcripts_per_file"][fname]
+                    st.text_area("", tr, height=250,
+                                 key=f"tr_{result['date']}_{fname}")
                     st.download_button(
                         "📥 文字起こし (.txt)",
-                        result["transcript"],
-                        file_name=f"transcript_{Path(result['filename']).stem}.txt",
+                        tr,
+                        file_name=f"transcript_{Path(fname).stem}.txt",
                         mime="text/plain",
-                        key=f"dtr_{result['filename']}_{result['date']}"
+                        key=f"dtr_{result['date']}_{fname}"
                     )
 
-            # レポート
+            # レポートタブ
             with tabs[1]:
                 if result["report"]:
                     st.markdown(result["report"])
+                    fname_base = (
+                        Path(result["file_labels"][0]).stem if n_files == 1
+                        else f"combined_{result['date'].replace(':','').replace(' ','_')}"
+                    )
                     st.download_button(
                         "📥 レポート (.md)",
                         result["report"],
-                        file_name=f"report_{Path(result['filename']).stem}.md",
+                        file_name=f"report_{fname_base}.md",
                         mime="text/markdown",
-                        key=f"drp_{result['filename']}_{result['date']}"
+                        key=f"drp_{result['date']}"
                     )
 
-            # 構造化サマリー
+            # 構造化サマリータブ
             if result.get("summary_html") and len(tabs) > 2:
                 with tabs[2]:
-                    st.info("💡 「HTMLで保存」してブラウザで開くと、見やすく印刷できます。")
-                    st.download_button(
-                        "📥 構造化サマリー HTML (.html)",
-                        result["summary_html"],
-                        file_name=f"summary_{Path(result['filename']).stem}.html",
-                        mime="text/html",
-                        key=f"dsum_{result['filename']}_{result['date']}"
+                    st.info("💡 「HTMLで保存」してブラウザで開くと、見やすく印刷・PDF化できます。")
+                    fname_base = (
+                        Path(result["file_labels"][0]).stem if n_files == 1
+                        else f"combined_{result['date'].replace(':','').replace(' ','_')}"
                     )
-                    # プレビュー（折りたたみ）
+                    st.download_button(
+                        "📥 構造化サマリー (.html)",
+                        result["summary_html"],
+                        file_name=f"summary_{fname_base}.html",
+                        mime="text/html",
+                        key=f"dsum_{result['date']}"
+                    )
                     with st.expander("🔍 プレビュー（アプリ内）"):
                         st.components.v1.html(result["summary_html"], height=800, scrolling=True)
 
