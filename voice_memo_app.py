@@ -7,6 +7,13 @@ from pathlib import Path
 from datetime import datetime
 import subprocess
 from openai import OpenAI
+import requests
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -28,6 +35,10 @@ if "api_key" not in st.session_state:
     st.session_state.api_key = _key
 if "results" not in st.session_state:
     st.session_state.results = []
+
+# Notion設定（環境変数から読み込み）
+NOTION_API_KEY     = os.environ.get("NOTION_API_KEY", "")
+NOTION_DB_KENSHU   = os.environ.get("NOTION_DB_ID_KENSHU", "475162c3cf1f4993a9b231e202ec40fb")
 
 
 # ═══════════════════════════════════════════
@@ -253,6 +264,180 @@ def extract_material_text(uploaded_file):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+# ═══════════════════════════════════════════
+# YouTube字幕取得
+# ═══════════════════════════════════════════
+def extract_youtube_id(url: str) -> str | None:
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/|/embed/)([^&\n?#]+)',
+        r'(?:shorts/)([^&\n?#]+)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_youtube_transcript(url: str) -> tuple[str | None, str]:
+    """YouTube URLから字幕テキストを取得。(text, video_id_or_error) を返す"""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    except ImportError:
+        return None, "youtube-transcript-api がインストールされていません"
+
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        return None, "YouTube URLからビデオIDを抽出できませんでした"
+
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        try:
+            transcript = transcript_list.find_transcript(['ja', 'ja-JP'])
+        except Exception:
+            try:
+                transcript = transcript_list.find_generated_transcript(['ja', 'ja-JP'])
+            except Exception:
+                transcript = transcript_list.find_generated_transcript(['en'])
+        entries = transcript.fetch()
+        text = " ".join(e.text for e in entries)
+        return text, video_id
+    except TranscriptsDisabled:
+        return None, "この動画では字幕が無効になっています"
+    except NoTranscriptFound:
+        return None, "字幕が見つかりませんでした（字幕なし動画）"
+    except Exception as e:
+        return None, f"字幕取得エラー: {e}"
+
+
+# ═══════════════════════════════════════════
+# レポートからタイトル・タグを抽出
+# ═══════════════════════════════════════════
+def extract_title_from_report(report: str) -> str:
+    for line in report.splitlines():
+        line = line.strip()
+        if line.startswith("# ") and not line.startswith("## "):
+            return line[2:].strip()
+    return "音声メモレポート"
+
+
+def extract_tags_from_report(report: str) -> list[str]:
+    for line in report.splitlines():
+        line = line.strip()
+        if line.startswith("> タグ：") or line.startswith("> タグ:"):
+            tags_str = re.sub(r'^> タグ[：:]', '', line).strip()
+            return [t.strip() for t in re.split(r'[、,，　 ]+', tags_str) if t.strip()]
+    return []
+
+
+# ═══════════════════════════════════════════
+# Markmap生成
+# ═══════════════════════════════════════════
+def generate_markmap(report: str, api_key: str) -> str | None:
+    """PLAUDレポートからMarkmap用Markdown見出し構造を生成"""
+    client = OpenAI(api_key=api_key)
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "あなたはMarkdown見出し構造のみを出力する専門家です。コードブロックや説明文は一切不要です。"},
+                {"role": "user", "content": f"""以下のレポートをMarkmap形式のMarkdown見出し構造に変換してください。
+ルール：
+- 見出し（# ## ###）のみ使用
+- 各ノードは短いキーワード（15文字以内）
+- コードブロック不要、見出しのみ出力
+- 深さは最大3階層
+
+レポート（抜粋）:
+{report[:5000]}"""}
+            ],
+            temperature=0.3,
+            max_tokens=800,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return None
+
+
+def render_markmap_html(markmap_md: str) -> str:
+    escaped = markmap_md.replace("`", "&#96;").replace("</", "<\\/")
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<script src="https://cdn.jsdelivr.net/npm/markmap-autoloader"></script>
+<style>
+html,body{{margin:0;padding:0;width:100%;height:100%;}}
+.markmap{{width:100%;height:520px;}}
+</style>
+</head>
+<body>
+<div class="markmap">
+
+{markmap_md}
+
+</div>
+</body>
+</html>"""
+
+
+# ═══════════════════════════════════════════
+# Notion 研修DB への保存
+# ═══════════════════════════════════════════
+def save_to_notion_kenshu(title: str, tags: list[str], source_type: str,
+                           report: str, summary: str) -> bool:
+    if not NOTION_API_KEY:
+        st.error("⚠️ NOTION_API_KEY が未設定です。環境変数を確認してください。")
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {NOTION_API_KEY}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    date_iso = datetime.now().strftime("%Y-%m-%d")
+
+    properties: dict = {
+        "タイトル": {"title": [{"text": {"content": title[:200]}}]},
+        "ジャンル": {"select": {"name": "その他"}},
+        "種別":   {"select": {"name": source_type}},
+        "実施日": {"date": {"start": date_iso}},
+        "作成日": {"date": {"start": date_iso}},
+        "概要":   {"rich_text": [{"text": {"content": summary[:500]}}]},
+    }
+    if tags:
+        properties["タグ"] = {"multi_select": [{"name": t[:100]} for t in tags[:5]]}
+
+    # レポートを2000文字チャンクに分割してブロック化
+    chunks = [report[i:i+1990] for i in range(0, min(len(report), 40000), 1990)]
+    children = [
+        {"object": "block", "type": "paragraph",
+         "paragraph": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
+        for c in chunks[:100]
+    ]
+
+    payload = {
+        "parent": {"database_id": NOTION_DB_KENSHU},
+        "properties": properties,
+        "children": children,
+    }
+
+    try:
+        resp = requests.post("https://api.notion.com/v1/pages",
+                             headers=headers, json=payload, timeout=30)
+        if resp.ok:
+            page_url = resp.json().get("url", "")
+            st.success(f"✅ Notionに保存しました！ [ページを開く]({page_url})")
+            return True
+        else:
+            msg = resp.json().get("message", resp.text[:200])
+            st.error(f"Notion保存エラー: {resp.status_code} - {msg}")
+            return False
+    except Exception as e:
+        st.error(f"Notion保存エラー: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════
@@ -620,7 +805,7 @@ body{{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--ink
 with st.sidebar:
     st.header("⚙️ 設定")
     if st.session_state.api_key:
-        st.success("✓ APIキー設定済み（環境変数 or Secrets）")
+        st.success("✓ OpenAI APIキー設定済み")
     else:
         api_key_input = st.text_input(
             "OpenAI APIキー", type="password",
@@ -631,24 +816,34 @@ with st.sidebar:
             st.session_state.api_key = api_key_input
             st.success("✓ APIキー設定済み")
 
+    if NOTION_API_KEY:
+        st.success("✓ Notion APIキー設定済み")
+    else:
+        st.warning("⚠️ NOTION_API_KEY 未設定（Notion保存不可）")
+
     st.divider()
     st.markdown("""
-### 📋 対応ファイル形式
-**🎵 音声（複数可）**
-MP3 / WAV / M4A / WebM
+### 📋 入力ソース
+| | 対応 |
+|---|---|
+| 🎵 音声 | MP3/WAV/M4A/WebM |
+| 🎬 YouTube | URLから字幕取得 |
+| 📝 テキスト | TXT/MD直接入力 |
 
-**📄 補足資料（任意・複数可）**
+**📄 補足資料（任意）**
 PDF / PPTX / DOCX
 
-### 📤 出力ファイル
-| | 内容 |
-|---|---|
-| .txt | 文字起こし |
-| .md | 詳細レポート |
-| .html | 構造化サマリー |
+### 📤 出力
+- PLAUDレポート（.md）
+- マインドマップ（Markmap）
+- Notion研修DB保存
 
-### ⚙️ トークン制限対策
-長い文字起こしは自動で調整して送信します。
+### ⚙️ Railway環境変数設定
+```
+NOTION_API_KEY=secret_xxx
+NOTION_DB_ID_KENSHU=475162c3cf1f4993a9b231e202ec40fb
+```
+`railway variables set` コマンドで追加してください。
 """)
 
 
@@ -656,74 +851,97 @@ PDF / PPTX / DOCX
 # UI：メイン
 # ═══════════════════════════════════════════
 st.title("🎙️ 音声メモアプリ Pro")
-st.caption("複数ファイル → 統合レポート ／ PDF・PPTX補完 ／ Plaud風レポート ／ 構造化サマリー")
+st.caption("音声 / YouTube / テキスト → PLAUDレポート ／ マインドマップ ／ Notion保存")
 
 if not st.session_state.api_key:
     st.warning("⚠️ OpenAI APIキーが未設定です。環境変数 OPENAI_API_KEY を設定するか、サイドバーで入力してください。")
     st.stop()
 
-# ── アップロードエリア（縦並び） ──
-st.subheader("🎵 音声ファイル（複数選択可）")
-st.caption("複数ファイルはファイル名順（作成日時順）で結合し、**1つのレポート**を作成します。")
-audio_files = st.file_uploader(
-    "MP3・WAV・M4A・WebM",
-    type=["mp3", "wav", "m4a", "webm"],
-    accept_multiple_files=True
+# ── 入力ソース選択 ──
+st.subheader("① 入力ソースを選択")
+source_type = st.radio(
+    "入力ソース",
+    ["🎵 音声ファイル", "🎬 YouTube URL", "📝 テキストファイル"],
+    horizontal=True,
+    label_visibility="collapsed",
 )
+
+audio_files = []
+youtube_url = ""
+text_files = []
+
+if source_type == "🎵 音声ファイル":
+    st.caption("複数ファイルはファイル名順で結合し、**1つのレポート**を作成します。")
+    audio_files = st.file_uploader(
+        "MP3・WAV・M4A・WebM",
+        type=["mp3", "wav", "m4a", "webm"],
+        accept_multiple_files=True,
+    )
+
+elif source_type == "🎬 YouTube URL":
+    st.caption("公開動画で字幕（自動生成を含む）が有効なものに対応します。")
+    youtube_url = st.text_input(
+        "YouTube URL", placeholder="https://www.youtube.com/watch?v=..."
+    )
+
+elif source_type == "📝 テキストファイル":
+    st.caption("TXT / MD ファイルをアップロード。Whisperをスキップして直接レポート生成します。")
+    text_files = st.file_uploader(
+        "TXT・MD",
+        type=["txt", "md"],
+        accept_multiple_files=True,
+    )
 
 st.markdown("---")
 
-st.subheader("📄 補足資料（任意・複数可）")
-st.caption("会議資料・スライドなど。**なくても動作します。**")
+# ── 補足資料 ──
+st.subheader("② 補足資料（任意・複数可）")
+st.caption("会議資料・スライドなど。なくても動作します。")
 material_files = st.file_uploader(
     "PDF・PPTX・DOCX",
     type=["pdf", "pptx", "ppt", "docx", "doc"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    key="material_uploader",
 )
 
-# ── ファイル確認表示 ──
-if audio_files:
-    def sort_key(f):
-        nums = re.findall(r'\d+', f.name)
-        return "".join(nums).zfill(20) if nums else f.name
+# ── 入力確認表示 ──
+has_input = bool(audio_files or youtube_url.strip() or text_files)
 
-    sorted_audio = sorted(audio_files, key=sort_key)
+if has_input:
+    if audio_files:
+        def sort_key(f):
+            nums = re.findall(r'\d+', f.name)
+            return "".join(nums).zfill(20) if nums else f.name
+        sorted_audio = sorted(audio_files, key=sort_key)
 
-    st.markdown("---")
-    with st.expander(
-        f"📋 処理予定：音声 {len(sorted_audio)}件（結合して1つのレポートを生成）",
-        expanded=True
-    ):
-        for i, f in enumerate(sorted_audio, 1):
-            mb = f.size / (1024 * 1024)
-            c1, c2, c3 = st.columns([5, 2, 2])
-            c1.write(f"**{i}.** {f.name}")
-            c2.caption(f"{mb:.1f} MB")
-            c3.caption("🔧 要圧縮" if mb > 24 else "✅ OK")
-        total_mb = sum(f.size for f in sorted_audio) / (1024 * 1024)
-        st.caption(f"合計：{total_mb:.1f} MB")
-        if len(sorted_audio) > 1:
-            st.info(f"💡 {len(sorted_audio)}件を順番に文字起こし → テキスト結合 → 1本のレポートを生成します。")
+        with st.expander(f"📋 音声ファイル {len(sorted_audio)}件", expanded=True):
+            for i, f in enumerate(sorted_audio, 1):
+                mb = f.size / (1024 * 1024)
+                c1, c2, c3 = st.columns([5, 2, 2])
+                c1.write(f"**{i}.** {f.name}")
+                c2.caption(f"{mb:.1f} MB")
+                c3.caption("🔧 要圧縮" if mb > 24 else "✅ OK")
+            if len(sorted_audio) > 1:
+                st.info(f"💡 {len(sorted_audio)}件を順番に文字起こし → 結合 → 1本のレポートを生成します。")
+    elif youtube_url.strip():
+        st.info(f"🎬 YouTube: {youtube_url.strip()}")
+    elif text_files:
+        st.info(f"📝 テキストファイル: {', '.join(f.name for f in text_files)}")
 
     if material_files:
         st.info(f"📎 補足資料（{len(material_files)}件）: {', '.join(f.name for f in material_files)}")
-    else:
-        st.caption("📎 補足資料なし")
 
     st.markdown("---")
     btn_col1, btn_col2 = st.columns(2)
-
     with btn_col1:
         if st.button("🗑️ 処理結果をクリア", use_container_width=True):
             st.session_state.results = []
-            st.success("✅ クリアしました。")
             st.rerun()
-
     with btn_col2:
         run = st.button("🚀 処理開始", type="primary", use_container_width=True)
 
     if run:
-        # 資料抽出
+        # ── 補足資料抽出 ──
         combined_material = None
         if material_files:
             with st.spinner("📄 補足資料を読み込み中..."):
@@ -738,80 +956,103 @@ if audio_files:
                 combined_material = "\n\n".join(mat_texts)
                 st.success(f"✅ 資料 {len(mat_texts)}件 読み込み完了")
 
-        # ── ステップ1：文字起こし ──
+        # ── STEP 1：テキスト取得 ──
         st.markdown("---")
-        st.markdown("### 🎧 ステップ1：文字起こし")
-
+        raw_transcript = ""
+        file_labels = []
         transcripts_per_file = {}
-        all_tmp_paths = []
+        source_label = "音声"  # Notion保存用
 
-        for idx, audio_file in enumerate(sorted_audio):
-            st.markdown(f"**[{idx+1}/{len(sorted_audio)}]** {audio_file.name}")
-            suffix = Path(audio_file.name).suffix
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                f.write(audio_file.read())
-                tmp_path = f.name
-                all_tmp_paths.append(tmp_path)
+        if source_type == "🎵 音声ファイル":
+            source_label = "音声"
+            st.markdown("### 🎧 STEP1：文字起こし")
+            all_tmp_paths = []
+            for idx, audio_file in enumerate(sorted_audio):
+                st.markdown(f"**[{idx+1}/{len(sorted_audio)}]** {audio_file.name}")
+                suffix = Path(audio_file.name).suffix
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+                    f.write(audio_file.read())
+                    tmp_path = f.name
+                    all_tmp_paths.append(tmp_path)
+                with st.spinner("  文字起こし中..."):
+                    tr = transcribe_audio(tmp_path, st.session_state.api_key)
+                if tr:
+                    transcripts_per_file[audio_file.name] = tr
+                    st.success(f"  ✅ 完了（{len(tr):,}文字）")
+                else:
+                    st.error("  ❌ 失敗")
+            for p in all_tmp_paths:
+                if os.path.exists(p):
+                    os.remove(p)
+            if not transcripts_per_file:
+                st.error("文字起こしに成功したファイルがありません。")
+                st.stop()
+            file_labels = list(transcripts_per_file.keys())
+            raw_transcript = (
+                list(transcripts_per_file.values())[0]
+                if len(file_labels) == 1
+                else "\n\n".join(f"--- {k} ---\n{v}" for k, v in transcripts_per_file.items())
+            )
+            st.success(f"✅ 文字起こし完了（合計 {len(raw_transcript):,}文字）")
 
-            with st.spinner("  文字起こし中..."):
-                transcript = transcribe_audio(tmp_path, st.session_state.api_key)
+        elif source_type == "🎬 YouTube URL":
+            source_label = "YouTube"
+            st.markdown("### 🎬 STEP1：YouTube字幕取得")
+            with st.spinner("字幕を取得中..."):
+                raw_transcript, video_id = get_youtube_transcript(youtube_url.strip())
+            if not raw_transcript:
+                st.error(f"❌ 字幕取得失敗: {video_id}")
+                st.stop()
+            file_labels = [youtube_url.strip()]
+            transcripts_per_file = {youtube_url.strip(): raw_transcript}
+            st.success(f"✅ 字幕取得完了（{len(raw_transcript):,}文字）")
 
-            if transcript:
-                transcripts_per_file[audio_file.name] = transcript
-                st.success(f"  ✅ 完了（{len(transcript):,}文字）")
-            else:
-                st.error(f"  ❌ 失敗")
+        elif source_type == "📝 テキストファイル":
+            source_label = "テキスト"
+            st.markdown("### 📝 STEP1：テキスト読み込み")
+            for tf in text_files:
+                content = tf.read().decode("utf-8", errors="replace")
+                transcripts_per_file[tf.name] = content
+                file_labels.append(tf.name)
+                st.success(f"✅ {tf.name}（{len(content):,}文字）")
+            raw_transcript = "\n\n".join(
+                f"--- {k} ---\n{v}" for k, v in transcripts_per_file.items()
+            ) if len(transcripts_per_file) > 1 else list(transcripts_per_file.values())[0]
 
-        for p in all_tmp_paths:
-            if os.path.exists(p):
-                os.remove(p)
-
-        if not transcripts_per_file:
-            st.error("文字起こしに成功したファイルがありません。")
-            st.stop()
-
-        file_labels = list(transcripts_per_file.keys())
-
-        # テキスト結合
-        if len(file_labels) == 1:
-            raw_transcript = list(transcripts_per_file.values())[0]
-        else:
-            parts = []
-            for fname, tr in transcripts_per_file.items():
-                parts.append(f"--- {fname} ---\n{tr}")
-            raw_transcript = "\n\n".join(parts)
-
-        total_chars = len(raw_transcript)
-        st.success(f"✅ 文字起こし完了（合計 {total_chars:,}文字）")
-
-        # ── トークン制限対策：長い場合は事前圧縮 ──
-        if total_chars > MAX_TRANSCRIPT_CHARS:
-            st.info(f"📝 テキストが長いため（{total_chars:,}文字）、要点を圧縮してからレポートを生成します...")
+        # ── 長文圧縮 ──
+        if len(raw_transcript) > MAX_TRANSCRIPT_CHARS:
+            st.info(f"📝 テキストが長いため圧縮します（{len(raw_transcript):,}文字）...")
             with st.spinner("圧縮中..."):
                 combined_transcript = compress_transcript(raw_transcript, st.session_state.api_key)
         else:
             combined_transcript = raw_transcript
 
-        # ── ステップ2：レポート生成 ──
-        st.markdown("### 📊 ステップ2：統合レポート生成")
+        # ── STEP 2：PLAUDレポート生成 ──
+        st.markdown("### 📊 STEP2：PLAUDレポート生成")
         with st.spinner("GPT-4o でレポート生成中..."):
             report = generate_report(
                 combined_transcript, file_labels, combined_material, st.session_state.api_key
             )
-
         if not report:
             st.error("レポート生成に失敗しました。")
             st.stop()
-
         st.success(f"✅ レポート完了{'（資料補完あり）' if combined_material else ''}")
 
-        # ── ステップ3：構造化サマリー生成 ──
-        st.markdown("### 📋 ステップ3：構造化サマリー生成")
+        # ── STEP 3：Markmap生成 ──
+        st.markdown("### 🗺️ STEP3：マインドマップ生成")
+        with st.spinner("Markmap生成中..."):
+            markmap_md = generate_markmap(report, st.session_state.api_key)
+        if markmap_md:
+            st.success("✅ マインドマップ生成完了")
+        else:
+            st.warning("⚠️ マインドマップ生成に失敗しました")
+
+        # ── STEP 4：構造化サマリー生成 ──
+        st.markdown("### 📋 STEP4：構造化サマリー生成")
         with st.spinner("構造化サマリー生成中..."):
             summary_data = generate_summary_json(
                 combined_transcript, report, combined_material, st.session_state.api_key
             )
-
         summary_html = None
         if summary_data:
             generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -824,10 +1065,12 @@ if audio_files:
             "file_labels": file_labels,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "transcripts_per_file": transcripts_per_file,
-            "combined_transcript": raw_transcript,   # 元のフル文字起こしを保存
+            "combined_transcript": raw_transcript,
             "report": report,
+            "markmap_md": markmap_md,
             "summary_html": summary_html,
-            "has_material": combined_material is not None
+            "has_material": combined_material is not None,
+            "source_label": source_label,
         }
         st.session_state.results = [result] + st.session_state.results
         st.balloons()
@@ -854,6 +1097,8 @@ if st.session_state.results:
 
         with st.expander(header_label, expanded=True):
             tab_labels = ["📄 文字起こし", "📊 レポート"]
+            if result.get("markmap_md"):
+                tab_labels.append("🗺️ マインドマップ")
             if result.get("summary_html"):
                 tab_labels.append("📋 構造化サマリー")
             tabs = st.tabs(tab_labels)
@@ -905,17 +1150,50 @@ if st.session_state.results:
                         Path(result["file_labels"][0]).stem if n_files == 1
                         else f"combined_{result['date'].replace(':','').replace(' ','_')}"
                     )
+                    dl_col, notion_col = st.columns([1, 1])
+                    with dl_col:
+                        st.download_button(
+                            "📥 レポート (.md)",
+                            result["report"],
+                            file_name=f"report_{fname_base}.md",
+                            mime="text/markdown",
+                            key=f"drp_{result['date']}",
+                        )
+                    with notion_col:
+                        if st.button("☁️ Notionに保存", key=f"notion_{result['date']}",
+                                     disabled=not NOTION_API_KEY):
+                            title = extract_title_from_report(result["report"])
+                            tags  = extract_tags_from_report(result["report"])
+                            summary_text = "\n".join(result["report"].splitlines()[:10])
+                            save_to_notion_kenshu(
+                                title=title,
+                                tags=tags,
+                                source_type=result.get("source_label", "音声"),
+                                report=result["report"],
+                                summary=summary_text,
+                            )
+                    if not NOTION_API_KEY:
+                        st.caption("⚠️ NOTION_API_KEY 未設定のため保存不可")
+
+            # マインドマップ
+            tab_idx = 2
+            if result.get("markmap_md"):
+                with tabs[tab_idx]:
+                    st.caption("💡 マウスホイールでズーム、ドラッグで移動できます。")
+                    mm_html = render_markmap_html(result["markmap_md"])
+                    st.components.v1.html(mm_html, height=560, scrolling=False)
                     st.download_button(
-                        "📥 レポート (.md)",
-                        result["report"],
-                        file_name=f"report_{fname_base}.md",
+                        "📥 Markmap (.md)",
+                        result["markmap_md"],
+                        file_name=f"markmap_{fname_base}.md",
                         mime="text/markdown",
-                        key=f"drp_{result['date']}"
+                        key=f"dmm_{result['date']}",
                     )
+                tab_idx += 1
 
             # 構造化サマリー
-            if result.get("summary_html") and len(tabs) > 2:
-                with tabs[2]:
+            if result.get("summary_html") and len(tabs) > tab_idx:
+                with tabs[tab_idx]:
                     st.info("💡 HTMLをダウンロードしてブラウザで開くと、見やすく印刷・PDF化できます。")
                     fname_base = (
                         Path(result["file_labels"][0]).stem if n_files == 1
@@ -926,7 +1204,7 @@ if st.session_state.results:
                         result["summary_html"],
                         file_name=f"summary_{fname_base}.html",
                         mime="text/html",
-                        key=f"dsum_{result['date']}"
+                        key=f"dsum_{result['date']}",
                     )
                     with st.expander("🔍 プレビュー（アプリ内）"):
                         st.components.v1.html(result["summary_html"], height=800, scrolling=True)
