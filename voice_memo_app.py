@@ -1168,6 +1168,7 @@ source_type = st.radio(
 audio_files = []
 youtube_url = ""
 text_files = []
+pasted_text = ""
 
 if source_type == "🎵 音声ファイル":
     st.caption("複数ファイルはファイル名順で結合し、**1つのレポート**を作成します。")
@@ -1184,11 +1185,19 @@ elif source_type == "🎬 YouTube URL":
     )
 
 elif source_type == "📝 テキストファイル":
-    st.caption("TXT / MD ファイルをアップロード。Whisperをスキップして直接レポート生成します。")
+    st.caption("TXT / MD ファイルをアップロード、またはテキストを直接貼り付けてください。Whisperをスキップして直接レポート生成します。")
     text_files = st.file_uploader(
-        "TXT・MD",
+        "TXT・MD（ファイルアップロード）",
         type=["txt", "md"],
         accept_multiple_files=True,
+    )
+    st.caption("または")
+    pasted_text = st.text_area(
+        "テキスト直接貼り付け",
+        height=300,
+        placeholder="文字起こしテキストをここに貼り付けてください...",
+        key="pasted_text_input",
+        label_visibility="collapsed",
     )
 
 st.markdown("---")
@@ -1216,7 +1225,7 @@ attachment_files = st.file_uploader(
 )
 
 # ── 入力確認表示 ──
-has_input = bool(audio_files or youtube_url.strip() or text_files)
+has_input = bool(audio_files or youtube_url.strip() or text_files or pasted_text.strip())
 
 if has_input:
     if audio_files:
@@ -1236,6 +1245,9 @@ if has_input:
                 st.info(f"💡 {len(sorted_audio)}件を順番に文字起こし → 結合 → 1本のレポートを生成します。")
     elif youtube_url.strip():
         st.info(f"🎬 YouTube: {youtube_url.strip()}")
+    elif pasted_text.strip():
+        preview = pasted_text.strip()[:80].replace("\n", " ")
+        st.info(f"📝 貼り付けテキスト（{len(pasted_text.strip()):,}文字）: {preview}...")
     elif text_files:
         st.info(f"📝 テキストファイル: {', '.join(f.name for f in text_files)}")
 
@@ -1317,11 +1329,17 @@ if has_input:
                 for line in video_id.splitlines():
                     st.error(line)
                 st.info(
-                    "💡 **対処法**\n"
-                    "- 字幕が無効 / 字幕なし動画 → `pip install yt-dlp` でフォールバックが有効になります\n"
-                    "- IP ブロック → しばらく待つか別のネットワークで試してください\n"
-                    "- 年齢制限 → 現時点では取得不可（API 制限）\n"
-                    "- URL フォーマット → `watch?v=` / `youtu.be/` / Shorts URL に対応しています"
+                    "💡 **対処法**\n\n"
+                    "**① 字幕をコピーして貼り付け（最も簡単）**\n"
+                    "  1. YouTube動画を開き、動画下の「…」→「文字起こし」をクリック\n"
+                    "  2. 表示されたテキストを全選択してコピー\n"
+                    "  3. 入力ソースを **「📝 テキストファイル」** に切り替えてテキスト欄に貼り付け\n\n"
+                    "**② yt-dlp フォールバック（音声からWhisper文字起こし）**\n"
+                    "  - `pip install yt-dlp` でインストールすると字幕なし動画にも対応します\n\n"
+                    "**③ その他の原因**\n"
+                    "  - IP ブロック → しばらく待つか別のネットワークで試してください\n"
+                    "  - 年齢制限 → 現時点では取得不可（API 制限）\n"
+                    "  - URL フォーマット → `watch?v=` / `youtu.be/` / Shorts URL に対応しています"
                 )
                 st.stop()
             file_labels = [youtube_url.strip()]
@@ -1331,11 +1349,23 @@ if has_input:
         elif source_type == "📝 テキストファイル":
             source_label = "テキスト"
             st.markdown("### 📝 STEP1：テキスト読み込み")
-            for tf in text_files:
-                content = tf.read().decode("utf-8", errors="replace")
-                transcripts_per_file[tf.name] = content
-                file_labels.append(tf.name)
-                st.success(f"✅ {tf.name}（{len(content):,}文字）")
+            # 貼り付けテキストを優先。なければファイルを読み込む
+            if pasted_text.strip():
+                content = pasted_text.strip()
+                transcripts_per_file["貼り付けテキスト"] = content
+                file_labels.append("貼り付けテキスト")
+                st.success(f"✅ 貼り付けテキスト（{len(content):,}文字）")
+                if text_files:
+                    st.info("💡 ファイルと貼り付けテキストの両方が入力されています。貼り付けテキストを優先して処理します。")
+            else:
+                for tf in text_files:
+                    content = tf.read().decode("utf-8", errors="replace")
+                    transcripts_per_file[tf.name] = content
+                    file_labels.append(tf.name)
+                    st.success(f"✅ {tf.name}（{len(content):,}文字）")
+            if not transcripts_per_file:
+                st.error("テキストが入力されていません。")
+                st.stop()
             raw_transcript = "\n\n".join(
                 f"--- {k} ---\n{v}" for k, v in transcripts_per_file.items()
             ) if len(transcripts_per_file) > 1 else list(transcripts_per_file.values())[0]
