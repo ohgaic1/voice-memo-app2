@@ -281,35 +281,154 @@ def extract_youtube_id(url: str) -> str | None:
     return None
 
 
-def get_youtube_transcript(url: str) -> tuple[str | None, str]:
-    """YouTube URLから字幕テキストを取得。(text, video_id_or_error) を返す"""
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
-    except ImportError:
-        return None, "youtube-transcript-api がインストールされていません"
+def _fetch_entries_text(entries) -> str:
+    """FetchedTranscript エントリ（v1.x オブジェクト or v0.x 辞書）からテキストを結合"""
+    parts = []
+    for e in entries:
+        if hasattr(e, "text"):
+            parts.append(e.text)
+        elif isinstance(e, dict):
+            parts.append(e.get("text", ""))
+    return " ".join(parts)
 
+
+def _youtube_whisper_fallback(url: str, video_id: str) -> tuple:
+    """字幕不可の場合に yt-dlp で音声ダウンロード → Whisper 文字起こしを試みる"""
+    try:
+        import yt_dlp  # optional dependency
+    except ImportError:
+        return (
+            None,
+            f"字幕が見つかりません（ID: {video_id}）。\n"
+            "音声からの文字起こしを行うには yt-dlp が必要です: pip install yt-dlp",
+        )
+
+    st.info("💬 字幕が見つかりません。yt-dlp で音声をダウンロードして Whisper で文字起こしを試みます...")
+    try:
+        import tempfile, glob
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+            ydl_opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": out_tmpl,
+                "quiet": True,
+                "no_warnings": True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            files = glob.glob(os.path.join(tmpdir, "*"))
+            if not files:
+                return None, "yt-dlp でのダウンロードに失敗しました"
+            audio_path = files[0]
+            api_key = st.session_state.get("api_key", "")
+            if not api_key:
+                return None, "音声ダウンロード成功しましたが OpenAI API キーがないため Whisper 文字起こしができません"
+            transcript = transcribe_audio(audio_path, api_key)
+            if transcript:
+                st.success(f"✅ Whisper フォールバック成功（{len(transcript):,}文字）")
+                return transcript, video_id
+            return None, "Whisper 文字起こしに失敗しました"
+    except Exception as e:
+        return None, f"音声ダウンロード / 文字起こしエラー: {str(e)[:200]}"
+
+
+def get_youtube_transcript(url: str) -> tuple:
+    """YouTube URL から字幕テキストを取得。字幕不可なら Whisper フォールバック。
+    Returns: (text_or_None, video_id_or_error_message)
+    """
+    # ── パッケージ確認 ──
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        from youtube_transcript_api._errors import (
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+            InvalidVideoId,
+        )
+    except ImportError as ie:
+        return None, f"youtube-transcript-api がインストールされていません: {ie}"
+
+    # v1.x の新エラー（v0.x では存在しない場合がある）
+    try:
+        from youtube_transcript_api._errors import RequestBlocked, IpBlocked, AgeRestricted
+        _HAS_V1_ERRORS = True
+    except ImportError:
+        RequestBlocked = IpBlocked = AgeRestricted = Exception  # 型チェック用ダミー
+        _HAS_V1_ERRORS = False
+
+    # ── URL からビデオ ID 抽出 ──
     video_id = extract_youtube_id(url)
     if not video_id:
-        return None, "YouTube URLからビデオIDを抽出できませんでした"
+        return None, (
+            "YouTube URL からビデオ ID を抽出できませんでした。\n"
+            "対応形式: https://www.youtube.com/watch?v=XXXXX "
+            "/ https://youtu.be/XXXXX / Shorts URL"
+        )
 
+    # ── 字幕取得（v1.x インスタンスメソッド） ──
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        try:
-            transcript = transcript_list.find_transcript(['ja', 'ja-JP'])
-        except Exception:
+        api = YouTubeTranscriptApi()
+        transcript_list = api.list(video_id)
+
+        # 優先度: ①手動日本語 → ②自動生成日本語 → ③英語 → ④何でも最初の1件
+        transcript = None
+        for finder, langs in [
+            ("find_manually_created_transcript", ["ja", "ja-JP"]),
+            ("find_generated_transcript",        ["ja", "ja-JP"]),
+            ("find_transcript",                  ["en", "en-US", "en-GB"]),
+        ]:
             try:
-                transcript = transcript_list.find_generated_transcript(['ja', 'ja-JP'])
+                transcript = getattr(transcript_list, finder)(langs)
+                break
             except Exception:
-                transcript = transcript_list.find_generated_transcript(['en'])
+                continue
+
+        if transcript is None:
+            for t in transcript_list:
+                transcript = t
+                break
+
+        if transcript is None:
+            return _youtube_whisper_fallback(url, video_id)
+
         entries = transcript.fetch()
-        text = " ".join(e.text for e in entries)
+        text = _fetch_entries_text(entries)
+        lang = getattr(transcript, "language", "不明")
+        is_gen = getattr(transcript, "is_generated", False)
+        st.caption(f"📝 字幕言語: {lang}（{'自動生成' if is_gen else '手動作成'}）")
         return text, video_id
+
     except TranscriptsDisabled:
-        return None, "この動画では字幕が無効になっています"
+        st.warning("⚠️ この動画では字幕が無効です。Whisper フォールバックを試みます...")
+        return _youtube_whisper_fallback(url, video_id)
+
     except NoTranscriptFound:
-        return None, "字幕が見つかりませんでした（字幕なし動画）"
+        st.warning("⚠️ 字幕が見つかりません。Whisper フォールバックを試みます...")
+        return _youtube_whisper_fallback(url, video_id)
+
+    except VideoUnavailable:
+        return None, f"動画が存在しないか非公開です（ID: {video_id}）"
+
+    except InvalidVideoId:
+        return None, f"無効なビデオ ID です: {video_id}"
+
     except Exception as e:
-        return None, f"字幕取得エラー: {e}"
+        err_str = str(e)
+        # v1.x 特有のエラーを文字列でもチェック（_HAS_V1_ERRORS が False の場合の保険）
+        if _HAS_V1_ERRORS and isinstance(e, AgeRestricted):
+            return None, "年齢制限のある動画は字幕取得できません（認証未対応）"
+        if _HAS_V1_ERRORS and isinstance(e, (RequestBlocked, IpBlocked)):
+            return None, (
+                "YouTube にアクセスがブロックされました（IP 制限）。\n"
+                "しばらく待つか、別のネットワークから試してください。"
+            )
+        if "429" in err_str or "too many requests" in err_str.lower():
+            return None, "リクエスト過多です（429）。しばらく待ってから再試行してください。"
+        if "age" in err_str.lower() and "restrict" in err_str.lower():
+            return None, "年齢制限のある動画は字幕取得できません"
+        if "unavailable" in err_str.lower() or "private" in err_str.lower():
+            return None, f"動画が利用不可または非公開です: {err_str[:100]}"
+        return None, f"字幕取得エラー: {err_str[:200]}"
 
 
 # ═══════════════════════════════════════════
@@ -1193,7 +1312,17 @@ if has_input:
             with st.spinner("字幕を取得中..."):
                 raw_transcript, video_id = get_youtube_transcript(youtube_url.strip())
             if not raw_transcript:
-                st.error(f"❌ 字幕取得失敗: {video_id}")
+                st.error(f"❌ 取得失敗")
+                # video_id には失敗理由が入っている
+                for line in video_id.splitlines():
+                    st.error(line)
+                st.info(
+                    "💡 **対処法**\n"
+                    "- 字幕が無効 / 字幕なし動画 → `pip install yt-dlp` でフォールバックが有効になります\n"
+                    "- IP ブロック → しばらく待つか別のネットワークで試してください\n"
+                    "- 年齢制限 → 現時点では取得不可（API 制限）\n"
+                    "- URL フォーマット → `watch?v=` / `youtu.be/` / Shorts URL に対応しています"
+                )
                 st.stop()
             file_labels = [youtube_url.strip()]
             transcripts_per_file = {youtube_url.strip(): raw_transcript}
