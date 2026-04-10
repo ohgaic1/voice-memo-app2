@@ -362,32 +362,132 @@ def generate_markmap(report: str, api_key: str) -> str | None:
 
 
 def render_markmap_html(markmap_md: str) -> str:
-    escaped = markmap_md.replace("`", "&#96;").replace("</", "<\\/")
     return f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
-<script src="https://cdn.jsdelivr.net/npm/markmap-autoloader"></script>
+<script src="https://cdn.jsdelivr.net/npm/markmap-autoloader@latest"></script>
 <style>
-html,body{{margin:0;padding:0;width:100%;height:100%;}}
-.markmap{{width:100%;height:520px;}}
+html,body{{margin:0;padding:0;width:100%;height:600px;overflow:hidden;}}
+#mm{{width:100%;height:600px;}}
 </style>
 </head>
 <body>
-<div class="markmap">
+<div class="markmap" id="mm">
 
 {markmap_md}
 
 </div>
+<script>
+window.addEventListener('load', function() {{
+  setTimeout(function() {{
+    var svgs = document.querySelectorAll('svg.markmap');
+    if (svgs.length > 0) {{
+      try {{
+        var mmInstance = svgs[0].__markmap;
+        if (mmInstance && mmInstance.fit) {{ mmInstance.fit(); }}
+      }} catch(e) {{}}
+    }}
+  }}, 800);
+}});
+</script>
 </body>
 </html>"""
 
 
 # ═══════════════════════════════════════════
+# Notion ブロックヘルパー
+# ═══════════════════════════════════════════
+def _rich_text(content: str) -> list:
+    chunks = [content[i:i+1990] for i in range(0, len(content), 1990)]
+    return [{"type": "text", "text": {"content": c}} for c in chunks[:10]]
+
+def _heading_block(level: int, text: str) -> dict:
+    t = f"heading_{level}"
+    return {"object": "block", "type": t, t: {"rich_text": _rich_text(text[:200])}}
+
+def _paragraph_block(text: str) -> dict:
+    return {"object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": _rich_text(text[:2000])}}
+
+def _bulleted_block(text: str) -> dict:
+    return {"object": "block", "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": _rich_text(text[:2000])}}
+
+def _numbered_block(text: str) -> dict:
+    return {"object": "block", "type": "numbered_list_item",
+            "numbered_list_item": {"rich_text": _rich_text(text[:2000])}}
+
+def _quote_block(text: str) -> dict:
+    return {"object": "block", "type": "quote",
+            "quote": {"rich_text": _rich_text(text[:2000])}}
+
+def _divider_block() -> dict:
+    return {"object": "block", "type": "divider", "divider": {}}
+
+def _code_block(content: str, language: str = "markdown") -> dict:
+    return {"object": "block", "type": "code",
+            "code": {"rich_text": _rich_text(content[:2000]), "language": language}}
+
+
+def markdown_to_notion_blocks(md: str) -> list:
+    """マークダウン文字列をNotionブロックリストに変換"""
+    blocks = []
+    for line in md.splitlines():
+        if line.startswith("# "):
+            blocks.append(_heading_block(1, line[2:].strip()))
+        elif line.startswith("## "):
+            blocks.append(_heading_block(2, line[3:].strip()))
+        elif line.startswith("### "):
+            blocks.append(_heading_block(3, line[4:].strip()))
+        elif re.match(r'^\d+\. ', line):
+            text = re.sub(r'^\d+\. ', '', line).strip()
+            blocks.append(_numbered_block(text))
+        elif line.startswith("- ") or line.startswith("* "):
+            text = line[2:].strip()
+            blocks.append(_bulleted_block(text))
+        elif line.startswith("> "):
+            text = line[2:].strip()
+            blocks.append(_quote_block(text))
+        elif line.strip() == "---":
+            blocks.append(_divider_block())
+        elif line.strip():
+            text = re.sub(r'`([^`]+)`', r'\1', line)
+            text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+            text = re.sub(r'\*([^*]+)\*', r'\1', text)
+            blocks.append(_paragraph_block(text))
+    return blocks
+
+
+def _append_blocks(page_id: str, blocks: list, headers: dict) -> None:
+    """90ブロックのバッチに分けてNotionページに追記"""
+    for i in range(0, len(blocks), 90):
+        batch = blocks[i:i+90]
+        resp = requests.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=headers,
+            json={"children": batch},
+            timeout=30,
+        )
+        if not resp.ok:
+            raise ValueError(f"ブロック追記エラー {resp.status_code}: {resp.text[:200]}")
+
+
+# ═══════════════════════════════════════════
 # Notion 研修DB への保存
 # ═══════════════════════════════════════════
-def save_to_notion_kenshu(title: str, tags: list[str], source_type: str,
-                           report: str, summary: str) -> bool:
+def save_to_notion_kenshu(
+    title: str,
+    tags: list,
+    source_type: str,
+    report: str,
+    summary: str,
+    transcript: str = "",
+    markmap_md: str = "",
+    summary_data: dict = None,
+    source_info: list = None,
+    attachment_file_info: list = None,
+) -> bool:
     if not NOTION_API_KEY:
         st.error("⚠️ NOTION_API_KEY が未設定です。環境変数を確認してください。")
         return False
@@ -410,33 +510,113 @@ def save_to_notion_kenshu(title: str, tags: list[str], source_type: str,
     if tags:
         properties["タグ"] = {"multi_select": [{"name": t[:100]} for t in tags[:5]]}
 
-    # レポートを2000文字チャンクに分割してブロック化
-    chunks = [report[i:i+1990] for i in range(0, min(len(report), 40000), 1990)]
-    children = [
-        {"object": "block", "type": "paragraph",
-         "paragraph": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
-        for c in chunks[:100]
-    ]
-
-    payload = {
-        "parent": {"database_id": NOTION_DB_KENSHU},
-        "properties": properties,
-        "children": children,
-    }
-
+    # ── ページ作成（本文なし）──
     try:
-        resp = requests.post("https://api.notion.com/v1/pages",
-                             headers=headers, json=payload, timeout=30)
-        if resp.ok:
-            page_url = resp.json().get("url", "")
-            st.success(f"✅ Notionに保存しました！ [ページを開く]({page_url})")
-            return True
-        else:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=headers,
+            json={"parent": {"database_id": NOTION_DB_KENSHU}, "properties": properties},
+            timeout=30,
+        )
+        if not resp.ok:
             msg = resp.json().get("message", resp.text[:200])
             st.error(f"Notion保存エラー: {resp.status_code} - {msg}")
             return False
+        page_data = resp.json()
+        page_id = page_data["id"]
+        page_url = page_data.get("url", "")
     except Exception as e:
         st.error(f"Notion保存エラー: {e}")
+        return False
+
+    try:
+        # ① 元データ
+        src_blocks = [_heading_block(2, "① 元データ")]
+        if source_info:
+            for s in source_info:
+                src_blocks.append(_bulleted_block(s))
+        else:
+            src_blocks.append(_paragraph_block("（情報なし）"))
+        _append_blocks(page_id, src_blocks, headers)
+
+        # ② 添付資料
+        att_blocks = [_divider_block(), _heading_block(2, "② 添付資料")]
+        if attachment_file_info:
+            for fi in attachment_file_info:
+                size_kb = fi.get("size", 0) // 1024
+                att_blocks.append(_bulleted_block(f"{fi['name']}  ({size_kb} KB)"))
+        else:
+            att_blocks.append(_paragraph_block("（なし）"))
+        _append_blocks(page_id, att_blocks, headers)
+
+        # ③ 文字起こし（トグルブロック）
+        toggle_header = [
+            _divider_block(),
+            {"object": "block", "type": "toggle",
+             "toggle": {"rich_text": _rich_text("③ 文字起こし（クリックで展開）")}},
+        ]
+        tog_resp = requests.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=headers,
+            json={"children": toggle_header},
+            timeout=30,
+        )
+        if tog_resp.ok and transcript.strip():
+            toggle_id = None
+            for b in tog_resp.json().get("results", []):
+                if b.get("type") == "toggle":
+                    toggle_id = b["id"]
+                    break
+            if toggle_id:
+                tr_chunks = [transcript[i:i+1990] for i in range(0, min(len(transcript), 60000), 1990)]
+                tr_blocks = [_paragraph_block(c) for c in tr_chunks[:90]]
+                _append_blocks(toggle_id, tr_blocks, headers)
+
+        # ④ PLAUDレポート
+        report_header = [_divider_block(), _heading_block(2, "④ PLAUDレポート")]
+        _append_blocks(page_id, report_header, headers)
+        report_blocks = markdown_to_notion_blocks(report)
+        _append_blocks(page_id, report_blocks[:200], headers)
+
+        # ⑤ マインドマップ
+        if markmap_md:
+            mm_blocks = [_divider_block(), _heading_block(2, "⑤ マインドマップ（Markmap）")]
+            mm_chunks = [markmap_md[i:i+1990] for i in range(0, min(len(markmap_md), 10000), 1990)]
+            for chunk in mm_chunks[:5]:
+                mm_blocks.append(_code_block(chunk, "markdown"))
+            _append_blocks(page_id, mm_blocks, headers)
+
+        # ⑥ 構造化サマリー
+        if summary_data:
+            sum_blocks = [_divider_block(), _heading_block(2, "⑥ 構造化サマリー")]
+            if summary_data.get("one_line"):
+                sum_blocks.append(_paragraph_block(f"📌 {summary_data['one_line']}"))
+            if summary_data.get("flow"):
+                sum_blocks.append(_heading_block(3, "フロー"))
+                for item in summary_data["flow"]:
+                    sum_blocks.append(_bulleted_block(
+                        f"【{item.get('time','')}】{item.get('topic','')} — {item.get('summary','')}"
+                    ))
+            if summary_data.get("decisions"):
+                sum_blocks.append(_heading_block(3, "決定事項"))
+                for d in summary_data["decisions"]:
+                    sum_blocks.append(_bulleted_block(f"✅ {d.get('title','')}：{d.get('detail','')}"))
+            if summary_data.get("actions"):
+                sum_blocks.append(_heading_block(3, "アクションアイテム"))
+                for a in summary_data["actions"]:
+                    sum_blocks.append(_bulleted_block(
+                        f"[{a.get('priority','')}] {a.get('what','')} — {a.get('who','未定')} / {a.get('when','期限未定')}"
+                    ))
+            if summary_data.get("keywords"):
+                sum_blocks.append(_heading_block(3, "キーワード"))
+                sum_blocks.append(_paragraph_block("  ".join(summary_data["keywords"])))
+            _append_blocks(page_id, sum_blocks, headers)
+
+        st.success(f"✅ Notionに保存しました！ [ページを開く]({page_url})")
+        return True
+
+    except Exception as e:
+        st.error(f"Notion本文追記エラー: {e}")
         return False
 
 
@@ -904,6 +1084,18 @@ material_files = st.file_uploader(
     key="material_uploader",
 )
 
+st.markdown("---")
+
+# ── 添付資料（Notion保存用）──
+st.subheader("③ 添付資料（Notion保存用・任意・複数可）")
+st.caption("Notionページに添付ファイル一覧として記録します（ファイル名と容量のみ保存）。")
+attachment_files = st.file_uploader(
+    "PDF・PPTX・DOCX",
+    type=["pdf", "pptx", "ppt", "docx", "doc"],
+    accept_multiple_files=True,
+    key="attachment_uploader",
+)
+
 # ── 入力確認表示 ──
 has_input = bool(audio_files or youtube_url.strip() or text_files)
 
@@ -1069,8 +1261,13 @@ if has_input:
             "report": report,
             "markmap_md": markmap_md,
             "summary_html": summary_html,
+            "summary_data": summary_data,
             "has_material": combined_material is not None,
             "source_label": source_label,
+            "youtube_url": youtube_url.strip() if source_type == "🎬 YouTube URL" else "",
+            "attachment_file_info": [
+                {"name": f.name, "size": f.size} for f in (attachment_files or [])
+            ],
         }
         st.session_state.results = [result] + st.session_state.results
         st.balloons()
@@ -1165,12 +1362,21 @@ if st.session_state.results:
                             title = extract_title_from_report(result["report"])
                             tags  = extract_tags_from_report(result["report"])
                             summary_text = "\n".join(result["report"].splitlines()[:10])
+                            # source_info: ファイル名またはURL一覧
+                            src_info = result.get("file_labels", [])
+                            if result.get("youtube_url"):
+                                src_info = [result["youtube_url"]]
                             save_to_notion_kenshu(
                                 title=title,
                                 tags=tags,
                                 source_type=result.get("source_label", "音声"),
                                 report=result["report"],
                                 summary=summary_text,
+                                transcript=result.get("combined_transcript", ""),
+                                markmap_md=result.get("markmap_md", ""),
+                                summary_data=result.get("summary_data"),
+                                source_info=src_info,
+                                attachment_file_info=result.get("attachment_file_info", []),
                             )
                     if not NOTION_API_KEY:
                         st.caption("⚠️ NOTION_API_KEY 未設定のため保存不可")
