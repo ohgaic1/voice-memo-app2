@@ -18,7 +18,14 @@ st.set_page_config(
 )
 
 if "api_key" not in st.session_state:
-    st.session_state.api_key = ""
+    # 優先順位: 1. 環境変数 / 2. st.secrets / 3. 空文字（サイドバー入力へ）
+    _key = os.environ.get("OPENAI_API_KEY", "")
+    if not _key:
+        try:
+            _key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            _key = ""
+    st.session_state.api_key = _key
 if "results" not in st.session_state:
     st.session_state.results = []
 
@@ -587,13 +594,17 @@ body{{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--ink
 # ═══════════════════════════════════════════
 with st.sidebar:
     st.header("⚙️ 設定")
-    api_key = st.text_input(
-        "OpenAI APIキー", type="password",
-        value=st.session_state.api_key
-    )
-    if api_key:
-        st.session_state.api_key = api_key
-        st.success("✓ APIキー設定済み")
+    if st.session_state.api_key:
+        st.success("✓ APIキー設定済み（環境変数 or Secrets）")
+    else:
+        api_key_input = st.text_input(
+            "OpenAI APIキー", type="password",
+            placeholder="sk-...",
+            help="環境変数 OPENAI_API_KEY が未設定の場合に入力"
+        )
+        if api_key_input:
+            st.session_state.api_key = api_key_input
+            st.success("✓ APIキー設定済み")
 
     st.divider()
     st.markdown("""
@@ -623,7 +634,7 @@ st.title("🎙️ 音声メモアプリ Pro")
 st.caption("複数ファイル → 統合レポート ／ PDF・PPTX補完 ／ Plaud風レポート ／ 構造化サマリー")
 
 if not st.session_state.api_key:
-    st.warning("⚠️ サイドバーでOpenAI APIキーを設定してください")
+    st.warning("⚠️ OpenAI APIキーが未設定です。環境変数 OPENAI_API_KEY を設定するか、サイドバーで入力してください。")
     st.stop()
 
 # ── アップロードエリア（縦並び） ──
