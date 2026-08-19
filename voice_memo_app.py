@@ -9,6 +9,16 @@ import subprocess
 from openai import OpenAI
 import requests
 
+# ★Notion の rich_text は1要素 2000字まで。切り捨てずに分割する仕組みは
+#   shared-lib/notion_rich_text に1つだけ置く。★ここで自前で書かない。2026-08-19。
+import sys as _sys_nrt
+from pathlib import Path as _Path_nrt
+for _sl_nrt in (_Path_nrt(r"C:\dev\shared-lib"),
+                _Path_nrt(r"C:\Users\ohgai\dev\shared-lib")):
+    if _sl_nrt.is_dir() and str(_sl_nrt) not in _sys_nrt.path:
+        _sys_nrt.path.insert(0, str(_sl_nrt))
+from notion_rich_text import text_to_rich_text as _rt_all  # noqa: E402
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -518,8 +528,14 @@ window.addEventListener('load', function() {{
 # Notion ブロックヘルパー
 # ═══════════════════════════════════════════
 def _rich_text(content: str) -> list:
-    chunks = [content[i:i+1990] for i in range(0, len(content), 1990)]
-    return [{"type": "text", "text": {"content": c}} for c in chunks[:10]]
+    """★分割は shared-lib/notion_rich_text に1つだけ置く（2026-08-19）。
+
+    旧実装は 1990字ごとに割ったうえで★先頭10塊で打ち切っていた（19,900字で
+    黙って消える）。さらに呼び出し側が `text[:2000]` で先に切っていたため、
+    ★2000字を超える段落は保存すらされていなかった。
+    共有の分割器は 2000字ごとに割り、入らない長さは例外で★はっきり失敗させる。
+    """
+    return _rt_all(content)
 
 def _heading_block(level: int, text: str) -> dict:
     t = f"heading_{level}"
@@ -527,26 +543,26 @@ def _heading_block(level: int, text: str) -> dict:
 
 def _paragraph_block(text: str) -> dict:
     return {"object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": _rich_text(text[:2000])}}
+            "paragraph": {"rich_text": _rich_text(text)}}
 
 def _bulleted_block(text: str) -> dict:
     return {"object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": _rich_text(text[:2000])}}
+            "bulleted_list_item": {"rich_text": _rich_text(text)}}
 
 def _numbered_block(text: str) -> dict:
     return {"object": "block", "type": "numbered_list_item",
-            "numbered_list_item": {"rich_text": _rich_text(text[:2000])}}
+            "numbered_list_item": {"rich_text": _rich_text(text)}}
 
 def _quote_block(text: str) -> dict:
     return {"object": "block", "type": "quote",
-            "quote": {"rich_text": _rich_text(text[:2000])}}
+            "quote": {"rich_text": _rich_text(text)}}
 
 def _divider_block() -> dict:
     return {"object": "block", "type": "divider", "divider": {}}
 
 def _code_block(content: str, language: str = "markdown") -> dict:
     return {"object": "block", "type": "code",
-            "code": {"rich_text": _rich_text(content[:2000]), "language": language}}
+            "code": {"rich_text": _rich_text(content), "language": language}}
 
 
 def markdown_to_notion_blocks(md: str) -> list:
