@@ -5,70 +5,58 @@ import re
 import json
 from pathlib import Path
 from datetime import datetime
+import shutil
 import subprocess
 from openai import OpenAI
 import requests
 
 # ═══════════════════════════════════════════
-# Notion の rich_text を★切り捨てずに分割する（★このファイルに同梱）
+# 共有ライブラリ（shared-lib）を読む
 # ═══════════════════════════════════════════
 #
-# ★2026-08-19 に shared-lib/notion_rich_text を読む形にしたが、
-#   ★このアプリだけは PC-B ではなく Streamlit Community Cloud で動いており、
-#   そこに shared-lib は★存在しない（Linux なので Windows のパスも無い）。
-#   2026-08-20 実測: クラウドを再現すると、この位置で
-#     ModuleNotFoundError: No module named 'notion_rich_text'
-#   となり★アプリが起動しなかった。PC-B ではテストが通るので気づけなかった。
+# ★2026-08-20: このアプリを Streamlit Community Cloud から PC-B へ移した。
+#   外では使わないと決めたので、同梱していた分割器（_rt_all）をやめ、
+#   ★他の20本以上のスクリプトと同じく shared-lib を読む形に揃えた。
+#   同梱していた理由は「クラウドに shared-lib が無い」だったので、
+#   ★動く場所が PC-B だけになった時点でその理由は消えている。
 #
 # ★try/except で「読めたら共有・読めなければ同梱」にはしない。
-#   それだと PC-B とクラウドで★違う実装が走り、
-#   テストが確かめているものと本番で動くものが別になる（＝今回と同じ形）。
-#   ★どこで動いても同じものが走るよう、同梱を必ず使う。
+#   それだと環境ごとに違う実装が走り、テストが見ているものと本番で動くものが
+#   別になる（2026-08-19 の事故がその形だった）。読めなければ落とす。
 #
-# ★同じ処理が2か所（ここと shared-lib）にある。ずれたら気づく形にしてある:
-#   dev-tools/tests/test_voice_memo_bundled_split.py が毎日、
-#   ★両方を実際に呼んで同じ入力に同じ出力を返すことを突き合わせる。
-#   直すときは★両方直すこと。片方だけ直すとそのテストが落ちる。
+# ★探し方は「隣」を先に見る。C:\dev\voice-memo-app2 の隣が C:\dev\shared-lib
+#   なので、PC-B でも CI でも同じ形（リポジトリを並べて置く）で解決できる。
 #
-# ★切り捨てには戻さないこと。旧実装は 1990字ごとに割って先頭10塊で打ち切り、
-#   呼び出し側も text[:2000] で先に切っていた（19,900字で黙って消えていた）。
+# ★破綻点（先に挙げたもの）:
+#   隣に shared-lib が無い環境では、ここで ModuleNotFoundError になり起動しない。
+#   今日の事故（クラウドに shared-lib が無い）の★逆方向。
+#   検知: .github/workflows/ci-cd.yml が ubuntu で shared-lib を隣に checkout し、
+#   ★実際に起動して health 200 を確かめる。checkout の行を外すとそこが赤になる。
+#   PC-B 側は dev-tools/tests/test_voice_memo_shared_lib.py が毎日確かめる。
+import sys as _sys
 
-#: Notion の rich_text 1要素の上限（文字数）。
-NOTION_RICH_TEXT_MAX = 2000
-#: Notion の rich_text 配列の上限（要素数）。
-NOTION_RICH_TEXT_MAX_BLOCKS = 100
+for _sl in (Path(__file__).resolve().parent.parent / "shared-lib",
+            Path(r"C:\dev\shared-lib"),
+            Path(r"C:\Users\ohgai\dev\shared-lib")):
+    if _sl.is_dir():
+        if str(_sl) not in _sys.path:
+            _sys.path.insert(0, str(_sl))
+        break
 
+#: ★Notion の rich_text は1要素 2000字まで。`text[:2000]` は保存時に中身を捨てる
+#  （切り捨てた事実は保存値に現れない）。分割は shared-lib に1つだけ置く。
+#  ★ここで自前で書かないこと。切り捨てにも戻さないこと。
+#  旧実装は 1990字ごとに割って先頭10塊で打ち切り、呼び出し側も text[:2000] で
+#  先に切っていた（19,900字で黙って消えていた）。
+from notion_rich_text import text_to_rich_text as _rt_all   # noqa: E402
 
-class RichTextTooLong(ValueError):
-    """★分割しても Notion に入らない長さ。黙って切らずに失敗させる。"""
+# ★.env の読み込みは shared-lib/env_loader を使う（override=True）。
+#   素の load_dotenv() は使わない ── 古い永続環境変数が .env に勝ち、
+#   2026-07-23〜27 に NOTION_TOKEN が4日間 401 を出し続けた事故の原因。
+#   ★これで OpenAI / Notion のキーを画面で毎回入力する必要がなくなる。
+from env_loader import load_env                             # noqa: E402
 
-
-def _rt_all(text, *, max_chars=None):
-    """★文字列を切らずに rich_text 配列にする（2000字ごとに分ける）。
-
-    ・中身は1文字も変えない。区切りも足さない。連結すれば元に戻る。
-    ・★`text[:2000]` の代わりにこれを呼ぶ。
-    ・入らない長さなら RichTextTooLong を投げる。★黙って切らない。
-
-    ★shared-lib/notion_rich_text.text_to_rich_text と同じ挙動にすること。
-    """
-    s = "" if text is None else str(text)
-    n = max_chars or NOTION_RICH_TEXT_MAX
-    if not s:
-        return [{"text": {"content": ""}}]
-    parts = [s[i:i + n] for i in range(0, len(s), n)]
-    if len(parts) > NOTION_RICH_TEXT_MAX_BLOCKS:
-        raise RichTextTooLong(
-            "rich_text が %d要素になり、上限 %d を超えます（%d字）。"
-            "★切り捨てずに、保存先の設計を見直してください。"
-            % (len(parts), NOTION_RICH_TEXT_MAX_BLOCKS, len(s)))
-    return [{"text": {"content": p}} for p in parts]
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+load_env()
 
 # ─────────────────────────────────────────
 # ページ設定
@@ -145,10 +133,62 @@ def compress_transcript(text: str, api_key: str) -> str:
 # ═══════════════════════════════════════════
 # 音声処理
 # ═══════════════════════════════════════════
+class FfmpegNotFound(RuntimeError):
+    """★ffmpeg が見つからない。黙って進まず、ここで止める。"""
+
+
+def _ffmpeg() -> str:
+    """★ffmpeg の実体を1か所で解決する。
+
+    ★2026-08-20 実測: PC-B の PATH に ffmpeg は無い。
+      Streamlit Community Cloud では packages.txt（中身は ffmpeg の1行）が
+      入れてくれていたので、★PC-B へ移すとここが失われる。
+      移設で消える依存はこれだけ。
+
+    探す順: .env の FFMPEG_PATH → PATH。
+    ★見つからないときは False を返さず例外で止める。
+      戻り値で失敗を伝えると呼び出し側が「圧縮エラー」としか出せず、
+      何が足りないのか画面から分からない。
+    """
+    p = (os.environ.get("FFMPEG_PATH", "") or "").strip().strip('"')
+    if p and Path(p).is_file():
+        return p
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    raise FfmpegNotFound(
+        "ffmpeg が見つかりません。24MB を超える音声の圧縮・分割ができません。 "
+        "ffmpeg を入れて PATH を通すか、"
+        ".env に FFMPEG_PATH=<ffmpeg.exe のフルパス> を書いてください。")
+
+
+def _ffprobe() -> str:
+    """★ffprobe も同じ理由で PC-B の PATH に無い（2026-08-20 実測）。
+
+    ffmpeg の公式ビルドには同じ場所に入っているので、まず ffmpeg の隣を見る。
+    """
+    p = (os.environ.get("FFPROBE_PATH", "") or "").strip().strip('"')
+    if p and Path(p).is_file():
+        return p
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    try:
+        near = Path(_ffmpeg()).with_name("ffprobe.exe")
+        if near.is_file():
+            return str(near)
+    except FfmpegNotFound:
+        pass
+    raise FfmpegNotFound(
+        "ffprobe が見つかりません。音声の分割ができません。 "
+        "ffmpeg を入れると同じ場所に入ります（PATH を通すか "
+        ".env に FFPROBE_PATH を書いてください）。")
+
+
 def compress_audio(input_path, output_path):
     try:
         subprocess.run(
-            ["ffmpeg", "-i", input_path, "-vn", "-ac", "1",
+            [_ffmpeg(), "-i", input_path, "-vn", "-ac", "1",
              "-ar", "16000", "-b:a", "32k", "-y", output_path],
             check=True, capture_output=True
         )
@@ -164,7 +204,7 @@ def split_audio(input_path, chunk_sec=600):
     try:
         # 時間を取得
         probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [_ffprobe(), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", input_path],
             capture_output=True, text=True, check=True
         )
@@ -177,7 +217,7 @@ def split_audio(input_path, chunk_sec=600):
         for i in range(num_chunks):
             output_chunk = f"{base}_chunk{i}.mp3"
             subprocess.run(
-                ["ffmpeg", "-i", input_path,
+                [_ffmpeg(), "-i", input_path,
                  "-ss", str(i * chunk_sec), "-t", str(chunk_sec),
                  "-c", "copy", "-y", output_chunk],
                 check=True, capture_output=True
@@ -573,16 +613,16 @@ window.addEventListener('load', function() {{
 # Notion ブロックヘルパー
 # ═══════════════════════════════════════════
 def _rich_text(content: str) -> list:
-    """★分割は _rt_all（このファイルの冒頭に同梱）に1つだけ置く。
+    """★分割は shared-lib/notion_rich_text に1つだけ置く。ここで書かない。
 
     旧実装は 1990字ごとに割ったうえで★先頭10塊で打ち切っていた（19,900字で
     黙って消える）。さらに呼び出し側が `text[:2000]` で先に切っていたため、
     ★2000字を超える段落は保存すらされていなかった。
     分割器は 2000字ごとに割り、入らない長さは例外で★はっきり失敗させる。
 
-    ★2026-08-20: 2026-08-19 は shared-lib を読む形にしていたが、
-      このアプリは Streamlit Community Cloud で動き、そこに shared-lib は
-      無いため★起動しなかった。冒頭に同梱した（理由は同所のコメント）。
+    ★2026-08-20: 一度は同梱に戻した（Streamlit Community Cloud に shared-lib が
+      無く起動しなかったため）。同日 PC-B へ移したので★同梱をやめ、共有に戻した。
+      経緯は冒頭のコメント。
     """
     return _rt_all(content)
 
@@ -1186,7 +1226,7 @@ with st.sidebar:
         st.warning("⚠️ NOTION_API_KEY 未設定（Notion保存不可）")
 
     st.divider()
-    st.markdown("""
+    st.markdown(r"""
 ### 📋 入力ソース
 | | 対応 |
 |---|---|
@@ -1202,12 +1242,15 @@ PDF / PPTX / DOCX
 - マインドマップ（Markmap）
 - Notion研修DB保存
 
-### ⚙️ Railway環境変数設定
-```
-NOTION_API_KEY=secret_xxx
-NOTION_DB_ID_KENSHU=475162c3cf1f4993a9b231e202ec40fb
-```
-`railway variables set` コマンドで追加してください。
+### ⚙️ 動かす場所
+★PC-B のローカル（2026-08-20 に外部クラウドから移設）。
+起動は他のローカルアプリと同じ `C:\dev\start_business.bat`
+（このアプリは http://localhost:8512）。
+
+### 🔑 キーの置き場
+★`C:\Users\ohga\OneDrive\secrets\.env` の1か所だけ。
+shared-lib/env_loader が読むので★画面での入力は不要です。
+（下の入力欄は .env が読めないときの最後の手段）
 """)
 
 

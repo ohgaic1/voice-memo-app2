@@ -26,43 +26,60 @@
 - 最新のGPT-4oモデルを使用して高品質な分析を実現
 - 日本語に最適化されたプロンプト設計
 
-## 🚀 デプロイ方法
+## 🖥️ 動かす場所（★2026-08-20 変更）
 
-### Streamlit Cloudへのデプロイ
+★**PC-B のローカルだけ**。外（Streamlit Community Cloud）では使わない。
 
-1. GitHubリポジトリを作成し、以下のファイルをアップロード:
-   - `voice_memo_app.py`
-   - `requirements.txt`
-   - `packages.txt`
-   - `README.md`
+移した理由（実測）:
 
-2. [Streamlit Cloud](https://streamlit.io/cloud)にアクセス
+- 外出先から使う要件は、README・コミット・reports のどこにも無かった
+- 過去の棚卸し（`ohga-office/reports/app_inventory_launcher_20260702.md`）では
+  ローカルの Streamlit アプリの1つ（ポート 8512）として扱われており、
+  `C:\dev\start_business.bat` には今もローカル起動の行が残っている
+- ★外で動かすことで起きていた問題が4つあり、すべて既に発生していた:
+  1. 共有ライブラリ（`C:\dev\shared-lib`）が読めず、同じ実装を同梱する羽目になった
+     （2026-08-19 に `ModuleNotFoundError` で起動しなくなった）
+  2. 秘密情報を `.env` とクラウド側の両方で持つ二重管理
+  3. 生存確認が外から判定できない（認証への転送で HTTP 303 が返り、
+     アプリが落ちていても「正常」に見えた。CI は15回連続で緑だった）
+  4. デプロイ完了待ち
 
-3. "New app"をクリックし、リポジトリを選択
+### 起動
 
-4. `voice_memo_app.py`をメインファイルとして指定
+他のローカルアプリと同じ作法。
 
-5. デプロイ完了！
-
-### ローカル実行
-
-```bash
-# 依存パッケージのインストール
-pip install -r requirements.txt
-
-# ffmpegのインストール（必須）
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt-get install ffmpeg
-
-# Windows
-# https://ffmpeg.org/download.html からダウンロード
-
-# アプリの起動
-streamlit run voice_memo_app.py
 ```
+C:\dev\start_business.bat
+```
+
+このアプリは http://localhost:8512 で開く（他は DocSort 8510 / Receipt 8511 /
+URLKnowledge 8513）。1本だけ起動するなら:
+
+```
+cd C:\dev\voice-memo-app2
+streamlit run voice_memo_app.py --server.port 8512
+```
+
+### 前提
+
+- `C:\dev\shared-lib` が隣にあること（`notion_rich_text` と `env_loader` を読む）
+- **ffmpeg / ffprobe** … ★PC-B の PATH には入っていない（2026-08-20 実測）。
+  クラウドでは `packages.txt` が入れてくれていたので、★移設で失われた依存はこれだけ。
+  24MB を超える音声を扱うときに要る。入れて PATH を通すか、`.env` に
+  `FFMPEG_PATH` / `FFPROBE_PATH` を書く。見つからないときは黙って進まず、
+  画面にその旨を出して止まる。
+
+### キー
+
+★`C:\Users\ohga\OneDrive\secrets\.env` の1か所だけ。`shared-lib/env_loader`
+（`override=True`）が読む。**画面での手入力は不要**。
+サイドバーの入力欄は `.env` が読めないときの最後の手段として残してある。
+
+### 生存確認
+
+`dev-tools/tests/test_voice_memo_shared_lib.py` が★実際にアプリを起動して
+`/_stcore/health` が 200 を返すことを確かめる（PC-B の既存のテスト群に乗せてある。
+新しい巡回や通知の区画は作っていない）。
 
 ## 📖 使い方
 
