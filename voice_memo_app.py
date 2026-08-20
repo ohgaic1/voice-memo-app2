@@ -55,6 +55,21 @@ from notion_rich_text import text_to_rich_text as _rt_all   # noqa: E402
 #   2026-07-23〜27 に NOTION_TOKEN が4日間 401 を出し続けた事故の原因。
 #   ★これで OpenAI / Notion のキーを画面で毎回入力する必要がなくなる。
 from env_loader import load_env                             # noqa: E402
+import api_usage                                            # noqa: E402
+import api_prices                                           # noqa: E402
+
+# ★このリポジトリの中の純粋な部分（API を1回も呼ばない）。試験はこちらで行う。
+import report_builder as RB                                 # noqa: E402
+
+#: 使用量の記録の「どこから」に入るアプリ名。
+USAGE_APP = "voice-memo-app2"
+
+# ★音声認識に渡す分野語彙。vocab/legal_ja.txt から読む（コードに書かない）。
+#   .env の VOCAB_FILE で別のファイルを足せる。
+#   ★入りきらなかった数も持っておき、画面に出す（黙って捨てない）。
+VOCAB_TERMS = RB.load_vocab(Path(__file__).resolve().parent,
+                            extra_path=os.environ.get("VOCAB_FILE", ""))
+VOCAB_PROMPT, VOCAB_USED, VOCAB_DROPPED = RB.whisper_prompt(VOCAB_TERMS)
 
 load_env()
 
@@ -87,47 +102,19 @@ NOTION_DB_KENSHU   = os.environ.get("NOTION_DB_ID_KENSHU", "475162c3cf1f4993a9b2
 # ═══════════════════════════════════════════
 # トークン制限対策：長いテキストを事前圧縮
 # ═══════════════════════════════════════════
-MAX_TRANSCRIPT_CHARS = 12000   # GPTに送る文字起こしの上限
-MAX_MATERIAL_CHARS   = 3000    # 資料テキストの上限
-MAX_REPORT_CHARS     = 4000    # サマリー生成時のレポートの上限
+# ★2026-08-20: MAX_TRANSCRIPT_CHARS（12000字で打ち切り）を廃止した。
+#   一定の長さを超えると先頭・中間・末尾の3か所を抜き取るだけで、
+#   残りを一度も読まなかった。今日の2時間の講演では★77.4%が読まれず、
+#   欠落を告げる仕組みが無いので出力は正常に見えていた。
+#   ★いまは区画に分けて全文を読み、読んだ量と捨てた量をレポートに書く。
+#   区画の大きさは report_builder.CHUNK_CHARS。
+MAX_MATERIAL_CHARS   = 12000   # 資料テキストの上限（★超えた分は画面に出す）
 
 
-def compress_transcript(text: str, api_key: str) -> str:
-    """
-    文字起こしが長すぎる場合、GPTで事前に要点を圧縮する。
-    圧縮後は MAX_TRANSCRIPT_CHARS 以内に収める。
-    """
-    if len(text) <= MAX_TRANSCRIPT_CHARS:
-        return text   # 短ければそのまま返す
-
-    client = OpenAI(api_key=api_key)
-    # 長い場合は先頭・中盤・末尾から均等にサンプリング
-    third = len(text) // 3
-    sampled = (
-        text[:4000] + "\n...(中略)...\n"
-        + text[third: third + 4000] + "\n...(中略)...\n"
-        + text[-4000:]
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",   # 圧縮はminiで十分
-            messages=[
-                {"role": "system", "content": "あなたは会議の内容を忠実に要約するアシスタントです。"},
-                {"role": "user", "content":
-                    f"以下の音声文字起こしを、重要な情報を落とさず8000文字以内に圧縮してください。"
-                    f"発言の流れ・決定事項・数値・固有名詞は必ず残してください。\n\n{sampled}"}
-            ],
-            temperature=0.2,
-            max_tokens=4000
-        )
-        compressed = resp.choices[0].message.content
-        st.info(f"📝 文字起こしを圧縮しました（{len(text):,}文字 → {len(compressed):,}文字）")
-        return compressed
-    except Exception:
-        # 圧縮失敗時はシンプルにカット
-        st.warning("⚠️ 圧縮に失敗したため先頭部分のみ使用します。")
-        return text[:MAX_TRANSCRIPT_CHARS]
+# ★compress_transcript（先頭・中間・末尾を4000字ずつ抜き取って要約する関数）は
+#   2026-08-20 に削除した。★これが 77.4% を黙って捨てていた実体。
+#   代わりに generate_report_full() が全文を区画に分けて読む。
+#   ★戻さないこと。戻したら tests/test_reads_everything.py が落ちる。
 
 
 # ═══════════════════════════════════════════
@@ -231,8 +218,29 @@ def split_audio(input_path, chunk_sec=600):
         return []
 
 
-def transcribe_audio(file_path, api_key):
-    """音声ファイルを文字起こし（大容量対応）"""
+def _segments_of(resp) -> list:
+    """★verbose_json の segments を辞書の一覧で取り出す。
+
+    SDK は pydantic の物を返すので、そのままでは添字で読めない。
+    ★取れなければ空を返す。ここで時刻を作らない（無い物を作らない）。
+    """
+    try:
+        d = resp.model_dump()
+    except Exception:                                        # noqa: BLE001
+        d = resp if isinstance(resp, dict) else {}
+    segs = d.get("segments") or []
+    return [x for x in segs if isinstance(x, dict)]
+
+
+def transcribe_audio(file_path, api_key, vocab_prompt: str = ""):
+    """音声ファイルを文字起こし（大容量対応）。返す: (時刻付き本文, セグメント)。
+
+    ★2026-08-20 追加。どちらも★渡すだけ・受け取るだけで、費用は変わらない。
+      ・vocab_prompt … 分野語彙のヒント。whisper が受け付けるのに渡していなかった。
+        実測: 渡さなかった 2026-08-20 の講演で 70組以上の誤変換が出た。
+      ・response_format="verbose_json" … 時刻付きのセグメントが返る。
+        これで章や欠落の位置を★時刻で言えるようになる。
+    """
     client = OpenAI(api_key=api_key)
     max_size = 24 * 1024 * 1024
     
@@ -260,15 +268,29 @@ def transcribe_audio(file_path, api_key):
                 return None
             
             texts = []
+            all_segments = []
             pb = st.progress(0)
             for i, chunk in enumerate(chunks):
                 with open(chunk, "rb") as f:
-                    resp = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=f,
-                        language="ja"
-                    )
-                    texts.append(resp.text)
+                    with api_usage.record(app=USAGE_APP, site="transcribe.chunk",
+                                          provider="openai",
+                                          operation="audio.transcriptions",
+                                          model="whisper-1") as _rec:
+                        resp = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=f,
+                            language="ja",
+                            prompt=vocab_prompt or "",
+                            response_format="verbose_json",
+                        )
+                        _rec.sdk_response(resp)
+                    segs = _segments_of(resp)
+                    off = i * 600            # split_audio の1区画は600秒
+                    all_segments.extend(
+                        dict(sg, start=float(sg.get("start", 0)) + off,
+                             end=float(sg.get("end", 0)) + off) for sg in segs)
+                    texts.append(RB.timestamped_text(segs, offset_sec=off)
+                                 or getattr(resp, "text", ""))
                 pb.progress((i + 1) / len(chunks))
                 os.remove(chunk)
             
@@ -276,25 +298,33 @@ def transcribe_audio(file_path, api_key):
             if work_path != file_path and os.path.exists(work_path):
                 os.remove(work_path)
             
-            return " ".join(texts).strip()
+            return "\n".join(texts).strip(), all_segments
         
         # 通常サイズ → そのまま文字起こし
         with open(work_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ja"
-            )
+            with api_usage.record(app=USAGE_APP, site="transcribe.single",
+                                  provider="openai",
+                                  operation="audio.transcriptions",
+                                  model="whisper-1") as _rec:
+                resp = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    language="ja",
+                    prompt=vocab_prompt or "",
+                    response_format="verbose_json",
+                )
+                _rec.sdk_response(resp)
         
         # 圧縮ファイルを削除
         if work_path != file_path and os.path.exists(work_path):
             os.remove(work_path)
         
-        return resp.text
-        
+        segs = _segments_of(resp)
+        return (RB.timestamped_text(segs) or getattr(resp, "text", "")), segs
+
     except Exception as e:
         st.error(f"文字起こしエラー: {e}")
-        return None
+        return None, []
 
 
 # ═══════════════════════════════════════════
@@ -418,7 +448,8 @@ def _youtube_whisper_fallback(url: str, video_id: str) -> tuple:
             api_key = st.session_state.get("api_key", "")
             if not api_key:
                 return None, "音声ダウンロード成功しましたが OpenAI API キーがないため Whisper 文字起こしができません"
-            transcript = transcribe_audio(audio_path, api_key)
+            transcript, _segs = transcribe_audio(audio_path, api_key,
+                                                 VOCAB_PROMPT)
             if transcript:
                 st.success(f"✅ Whisper フォールバック成功（{len(transcript):,}文字）")
                 return transcript, video_id
@@ -847,141 +878,202 @@ def save_to_notion_kenshu(
 # ═══════════════════════════════════════════
 # GPT：Plaud風レポート
 # ═══════════════════════════════════════════
-def generate_report(combined_transcript, file_labels, material_text, api_key):
+# ★generate_report（文字起こしを 12000字で切ってから1回で書かせていた関数）は
+#   2026-08-20 に削除した。出力も max_tokens=4000 で頭打ちだった。
+#   代わりは generate_report_full()。★戻さないこと。
+
+
+# ═══════════════════════════════════════════
+# GPT：全文を読んでレポートを作る（★抜き取らない）
+# ═══════════════════════════════════════════
+_CHUNK_SYSTEM = (
+    "あなたは講演・会議の記録係です。渡された文字起こしの区間を、"
+    "★要約せずに章立てして書き起こします。渡された範囲の内容だけを使い、"
+    "知識で補いません。分からないものは「不明」と書きます。"
+)
+
+_CHUNK_TEMPLATE = """以下は、ある録音の文字起こしの★一部（区間 {i}/{n}）です。
+この区間に出てくる話題を、論点ごとに章に分けて書いてください。
+
+【この区間の直前（文脈のためだけに渡します。★ここから章を作らないこと）】
+{context}
+
+【この区間の本文（★ここを全部読んで章にする）】
+{body}
+{material}
+---
+出力の決まり:
+- 見出しは `### 【主題】` の形。★他の区間を参照しない（その章だけで意味が通るように）
+- 各章に次を書く:
+  **何が語られたか**（要約せずに、話の筋・理由・背景を落とさず）
+  **講師が述べた根拠・理由**
+  **具体例・数字**（無ければ「なし」）
+  **言い切られていないこと**（断定していない部分。★ここを落とさない）
+- ★文字起こしに無いことを足さない。知識で埋めない
+- ★区間の最後まで扱うこと。途中で「以下略」としない
+- 前置きや締めの文は書かない。章だけを出力する"""
+
+_OVERVIEW_SYSTEM = (
+    "あなたは記録係です。★章の見出しだけを見て、全体像を書きます。"
+    "見出しに無いことを足しません。"
+)
+
+
+def generate_chunk_chapters(chunk, i, n, material_text, api_key):
+    """★1区画ぶんの章を作る。戻り値は RB.ChunkResult。"""
     client = OpenAI(api_key=api_key)
-
-    # ── 入力テキストを制限内に収める ──
-    safe_transcript = combined_transcript[:MAX_TRANSCRIPT_CHARS]
-    if len(combined_transcript) > MAX_TRANSCRIPT_CHARS:
-        st.info(f"📝 レポート生成のため文字起こしを {MAX_TRANSCRIPT_CHARS:,}文字に調整しました（元: {len(combined_transcript):,}文字）")
-
-    safe_material = ""
+    mat = ""
     if material_text and material_text.strip():
-        safe_material = f"""
----
-【補足資料】
-{material_text[:MAX_MATERIAL_CHARS]}
----
-上記資料の数値・固有名詞・用語を積極的に活用してください。
-"""
-
-    files_note = (
-        f"※ 本レポートは以下 {len(file_labels)} 件の音声ファイルを統合した内容です：\n"
-        + "\n".join(f"  - {l}" for l in file_labels)
-    ) if len(file_labels) > 1 else ""
-
-    prompt = f"""以下の音声文字起こしを全て読み込み、PLAUD形式の詳細レポートを日本語で作成してください。
-{files_note}
-{safe_material}
-【文字起こし】
-{safe_transcript}
-
----
-
-以下のフォーマットに厳密に従って出力してください。
-
-# {{タイトル（内容を表す簡潔なタイトル）}}
-
-> 日時：{{録音日時（不明な場合は「不明」）}}
-> タグ：{{内容から自動生成した3〜5個のキーワードをカンマ区切りで記載}}
-
-## テーマ
-{{全体の内容を2〜3文で要約}}
-
-## 要点
-1. {{要点1}}
-2. {{要点2}}
-3. {{要点3}}
-（内容に応じて5〜10個）
-
-## ハイライト
-- `"{{文字起こしの原文をそのまま引用1}}"`
-- `"{{文字起こしの原文をそのまま引用2}}"`
-- `"{{文字起こしの原文をそのまま引用3}}"`
-（印象的・重要な発言を3〜6個、必ず原文をそのまま引用すること）
-
-## 章とトピック
-### {{章タイトル1（文字起こしの流れに沿ったトピック名）}}
-> {{章の概要を2〜3文}}
-- **要点**
-  - {{要点箇条書き}}
-- **説明**
-  {{詳細説明}}
-- **Examples**
-  > {{具体例の引用または説明}}
-  - {{実務上の対応や示唆}}
-- **留意点**
-  - {{注意事項}}
-- **特別な状況**
-  - {{もし〜の場合の対応（該当する場合のみ記載）}}
-
-### {{章タイトル2}}
-（トピックごとに同じ構造で繰り返す）
-
-## 宿題と提案
-- {{会話中に出てきた具体的なアクションアイテム1}}
-- {{会話中に出てきた具体的なアクションアイテム2}}
-（該当がない場合は「特になし」と記載）
-
----
-【作成上の注意】
-- 文字起こしにない情報は追加しないこと
-- ハイライトは文字起こしの原文を一字一句そのまま引用すること
-- 章とトピックは文字起こしの話題の流れに沿って分割すること
-- 宿題と提案は会話中に明示的に出てきたアクションのみ記載すること
-- 全て日本語で出力すること"""
-
+        mat = ("\n【配付資料（用語・固有名詞の表記はこちらに合わせる）】\n"
+               + material_text[:MAX_MATERIAL_CHARS] + "\n")
+    prompt = _CHUNK_TEMPLATE.format(
+        i=i + 1, n=n, context=chunk.context or "（なし）",
+        body=chunk.body, material=mat)
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "あなたは音声メモからPLAUD形式の高品質な構造化レポートを作成する専門家です。指定されたフォーマットに厳密に従い、文字起こしの内容を網羅的に整理してください。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=4000
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        error_str = str(e)
-        if "rate_limit_exceeded" in error_str or "too large" in error_str.lower():
-            st.warning("⚠️ テキストが長すぎるため、さらに短縮して再試行します...")
-            short_transcript = combined_transcript[:6000]
-            try:
-                resp2 = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "あなたは音声メモからPLAUD形式の高品質な構造化レポートを作成する専門家です。指定されたフォーマットに厳密に従い、文字起こしの内容を網羅的に整理してください。"},
-                        {"role": "user", "content": prompt.replace(safe_transcript, short_transcript)}
-                    ],
-                    temperature=0.3,
-                    max_tokens=4000
-                )
-                return resp2.choices[0].message.content
-            except Exception as e2:
-                st.error(f"レポート生成エラー（再試行後）: {e2}")
-                return None
-        st.error(f"レポート生成エラー: {e}")
-        return None
+        with api_usage.record(app=USAGE_APP, site="report.chunk",
+                              provider="openai", operation="chat.completions",
+                              model="gpt-4o") as _rec:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "system", "content": _CHUNK_SYSTEM},
+                          {"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=8000,
+            )
+            _rec.sdk_response(resp)
+        ch = resp.choices[0]
+        u = getattr(resp, "usage", None)
+        return RB.ChunkResult(
+            index=chunk.index, ok=True, text=ch.message.content or "",
+            finish_reason=getattr(ch, "finish_reason", "") or "",
+            in_tokens=getattr(u, "prompt_tokens", None),
+            out_tokens=getattr(u, "completion_tokens", None))
+    except Exception as e:                                   # noqa: BLE001
+        # ★握り潰さない。失敗した区画は「捨てた量」に入り、レポートに出る。
+        return RB.ChunkResult(index=chunk.index, ok=False,
+                              error="%s: %s" % (type(e).__name__, str(e)[:200]))
+
+
+def generate_overview(titles, api_key):
+    """★材料は章の見出しだけ。本編を渡さない（もう一度要約されないため）。"""
+    if not titles:
+        return ""
+    client = OpenAI(api_key=api_key)
+    try:
+        with api_usage.record(app=USAGE_APP, site="report.overview",
+                              provider="openai", operation="chat.completions",
+                              model="gpt-4o") as _rec:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _OVERVIEW_SYSTEM},
+                    {"role": "user", "content":
+                        "次は、ある録音のレポートの章の見出し一覧です。"
+                        "これだけを材料に、全体が何の話で、聞き手が何を"
+                        "持ち帰るべきかを300字程度で書いてください。"
+                        "★見出しに無いことは書かないでください。\n\n"
+                        + "\n".join("- " + t for t in titles)},
+                ],
+                temperature=0.3,
+                max_tokens=800,
+            )
+            _rec.sdk_response(resp)
+        return resp.choices[0].message.content or ""
+    except Exception as e:                                   # noqa: BLE001
+        st.warning(f"⚠️ 全体像の生成に失敗しました（本編は影響を受けません）: {e}")
+        return ""
+
+
+def generate_report_full(transcript, file_labels, material_text, api_key,
+                         segments=None, title="", allow_over_limit=False):
+    """★全文を区画に分けて読み、章を連結してレポートにする。
+
+    ★ここで要約はしない。区画の出力をそのまま連結する。
+    ★見込みが上限を超えたら止める。抜き取りには倒れない。
+    """
+    chunks = RB.split_for_reading(transcript)
+
+    # ★資料を切るなら、切ったことを画面とレポートの両方に出す（黙って捨てない）。
+    material_note = ""
+    if material_text and len(material_text) > MAX_MATERIAL_CHARS:
+        material_note = ("★配付資料は %s字あり、各区画には先頭 %s字だけを渡しています"
+                         "（%s字は渡していません）。"
+                         % (f"{len(material_text):,}", f"{MAX_MATERIAL_CHARS:,}",
+                            f"{len(material_text) - MAX_MATERIAL_CHARS:,}"))
+        st.warning("⚠️ " + material_note)
+
+    est = RB.estimate_plan_jpy(
+        total_chars=len(transcript),
+        material_chars=len(material_text or ""),
+        prompt_chars=len(_CHUNK_TEMPLATE),
+        n_chunks=len(chunks),
+        out_chars_per_chunk=int(RB.CHUNK_CHARS * 0.6))
+    st.info("💴 " + RB.cost_note(est))
+    if est["over_limit"] and not allow_over_limit:
+        raise RB.CostLimitExceeded(
+            "見込み %.0f円 が上限 %d円 を超えました（区画%d本）。"
+            "★一部だけ読む形には倒しません。実行していません。"
+            % (est["jpy"], est["limit_jpy"], len(chunks)))
+
+    results = []
+    pb = st.progress(0.0, text="区画 0/%d" % len(chunks))
+    for i, c in enumerate(chunks):
+        results.append(generate_chunk_chapters(c, i, len(chunks),
+                                               material_text, api_key))
+        pb.progress((i + 1) / len(chunks),
+                    text="区画 %d/%d（%s字）" % (i + 1, len(chunks), f"{c.chars:,}"))
+
+    cov = RB.coverage(len(transcript), chunks, results)
+    bad = [r for r in results if not r.ok]
+    if bad:
+        st.error("★%d区画が読めませんでした。レポートに欠落として明記します。\n%s"
+                 % (len(bad), "\n".join("- 区画%d: %s" % (r.index, r.error)
+                                        for r in bad)))
+    if cov["truncated"]:
+        st.warning("★出力の上限で途中までになった区画: %s"
+                   % ", ".join(str(i) for i in cov["truncated"]))
+
+    chapters = [r.text for r in results if r.ok and r.text.strip()]
+    overview = generate_overview(RB.chapter_titles(chapters), api_key)
+    gaps = RB.silent_gaps(segments) if segments else None
+    note = ("※ 音声認識の出力をもとにした記録です。条文・法令名・数値は"
+            "一次資料と突き合わせてください。")
+    if material_note:
+        note += "\n\n" + material_note
+    return RB.assemble(title or "／".join(file_labels), overview, chapters,
+                       cov, gaps, note), cov, est
 
 
 # ═══════════════════════════════════════════
 # GPT：構造化サマリー（JSON）
 # ═══════════════════════════════════════════
-def generate_summary_json(combined_transcript, report, material_text, api_key):
+def generate_summary_json(chapter_titles, report, material_text, api_key):
+    """★2026-08-20 変更。文字起こしの先頭6000字を渡すのをやめた。
+
+    先頭だけを見て「全体のサマリー」を名乗るのは、★中身が落ちたことが
+    分からない形（今回直したのと同じ形）。ここでは
+    ・章の見出し（全章ぶん・落ちない）
+    ・本編そのもの
+    を渡す。★本編が長くて入らない場合は、切ったことを本文に書く。
+    """
     client = OpenAI(api_key=api_key)
 
-    # ── 入力を制限 ──
-    safe_transcript = combined_transcript[:6000]
-    safe_report     = report[:MAX_REPORT_CHARS]
+    titles_txt = "\n".join("- " + t for t in (chapter_titles or [])) or "（なし）"
+    safe_report = report
+    cut_note = ""
+    if len(report) > 60000:
+        safe_report = report[:60000]
+        cut_note = ("\n★注意: レポートが長いため先頭60,000字だけを渡しています"
+                    "（元 %s字）。このサマリーは全体を見ていません。\n"
+                    % f"{len(report):,}")
     mat_note = "補足資料の情報も反映してください。" if material_text else ""
 
-    prompt = f"""以下の音声文字起こしとレポートから、構造化サマリーをJSON形式で作成してください。{mat_note}
+    prompt = f"""以下のレポートから、構造化サマリーをJSON形式で作成してください。{mat_note}
+{cut_note}
+【章の見出し（★全章ぶん）】
+{titles_txt}
 
-【文字起こし（抜粋）】
-{safe_transcript}
-
-【レポート（抜粋）】
+【レポート本文】
 {safe_report}
 
 以下のJSON構造で出力してください（日本語で）。
@@ -1253,6 +1345,31 @@ shared-lib/env_loader が読むので★画面での入力は不要です。
 （下の入力欄は .env が読めないときの最後の手段）
 """)
 
+    # ── ★語彙ヒントの状態（黙って捨てない）──
+    if VOCAB_TERMS:
+        st.caption("🗣️ 語彙ヒント: %d語中 %d語を音声認識に渡します"
+                   % (len(VOCAB_TERMS), VOCAB_USED))
+        if VOCAB_DROPPED:
+            st.warning("★%d語が上限（%d字）に入りませんでした。"
+                       "vocab/legal_ja.txt の上の方に並べ替えてください。"
+                       % (VOCAB_DROPPED, RB.VOCAB_PROMPT_MAX_CHARS))
+    else:
+        st.caption("🗣️ 語彙ヒントなし（vocab/legal_ja.txt が読めません）")
+
+    # ── ★費用の上限を外す（日常の操作と分ける）──
+    #   ★既定は外れている。押しやすい場所には置かない。
+    #   上限を超えたときに「一部だけ読む」へ倒れないための、唯一の逃げ道。
+    with st.expander("★費用の上限を外す（%d円）" % RB.COST_LIMIT_JPY):
+        st.caption(
+            "1回あたりの見込みが %d円 を超えると、実行せずに止まります。"
+            "★止まったときに一部だけ読む形には倒れません。"
+            "承知のうえで続ける場合だけ、ここに印を付けてください。"
+            % RB.COST_LIMIT_JPY)
+        st.session_state["allow_over_limit"] = st.checkbox(
+            "上限を超えても実行する", value=False, key="allow_over_limit_cb")
+        if st.session_state.get("allow_over_limit"):
+            st.warning("★上限が外れています。実行前に見込み額を確かめてください。")
+
 
 # ═══════════════════════════════════════════
 # UI：メイン
@@ -1392,6 +1509,8 @@ if has_input:
         raw_transcript = ""
         file_labels = []
         transcripts_per_file = {}
+        # ★時刻付きセグメント。音声以外の入力では空のまま（無い物を作らない）。
+        all_segments = []
         source_label = "音声"  # Notion保存用
 
         if source_type == "🎵 音声ファイル":
@@ -1406,8 +1525,10 @@ if has_input:
                     tmp_path = f.name
                     all_tmp_paths.append(tmp_path)
                 with st.spinner("  文字起こし中..."):
-                    tr = transcribe_audio(tmp_path, st.session_state.api_key)
+                    tr, segs = transcribe_audio(
+                        tmp_path, st.session_state.api_key, VOCAB_PROMPT)
                 if tr:
+                    all_segments.extend(segs or [])
                     transcripts_per_file[audio_file.name] = tr
                     st.success(f"  ✅ 完了（{len(tr):,}文字）")
                 else:
@@ -1478,24 +1599,31 @@ if has_input:
                 f"--- {k} ---\n{v}" for k, v in transcripts_per_file.items()
             ) if len(transcripts_per_file) > 1 else list(transcripts_per_file.values())[0]
 
-        # ── 長文圧縮 ──
-        if len(raw_transcript) > MAX_TRANSCRIPT_CHARS:
-            st.info(f"📝 テキストが長いため圧縮します（{len(raw_transcript):,}文字）...")
-            with st.spinner("圧縮中..."):
-                combined_transcript = compress_transcript(raw_transcript, st.session_state.api_key)
-        else:
-            combined_transcript = raw_transcript
+        # ── ★全文を読む（抜き取りはしない）──
+        combined_transcript = raw_transcript
 
-        # ── STEP 2：PLAUDレポート生成 ──
-        st.markdown("### 📊 STEP2：PLAUDレポート生成")
-        with st.spinner("GPT-4o でレポート生成中..."):
-            report = generate_report(
-                combined_transcript, file_labels, combined_material, st.session_state.api_key
-            )
+        st.markdown("### 📊 STEP2：レポート生成（★全文を読みます）")
+        try:
+            with st.spinner("区画ごとに読んでいます..."):
+                report, coverage_info, cost_info = generate_report_full(
+                    combined_transcript, file_labels, combined_material,
+                    st.session_state.api_key, segments=all_segments,
+                    allow_over_limit=st.session_state.get("allow_over_limit", False),
+                )
+        except RB.CostLimitExceeded as e:
+            # ★ここで一部だけ読む形に倒れない。止まる。
+            st.error("🛑 %s" % e)
+            st.info("続ける場合は、サイドバー最下部の「★費用の上限を外す」を"
+                    "開いて印を付けてから、もう一度実行してください。")
+            st.stop()
         if not report:
             st.error("レポート生成に失敗しました。")
             st.stop()
-        st.success(f"✅ レポート完了{'（資料補完あり）' if combined_material else ''}")
+        st.success("✅ レポート完了（★%s字中 %s字を読了・%.1f%%）%s"
+                   % (f"{coverage_info['total_chars']:,}",
+                      f"{coverage_info['read_chars']:,}",
+                      coverage_info["ratio"] * 100,
+                      "（資料補完あり）" if combined_material else ""))
 
         # ── STEP 3：Markmap生成 ──
         st.markdown("### 🗺️ STEP3：マインドマップ生成")
@@ -1510,7 +1638,8 @@ if has_input:
         st.markdown("### 📋 STEP4：構造化サマリー生成")
         with st.spinner("構造化サマリー生成中..."):
             summary_data = generate_summary_json(
-                combined_transcript, report, combined_material, st.session_state.api_key
+                RB.chapter_titles([report]), report, combined_material,
+                st.session_state.api_key
             )
         summary_html = None
         if summary_data:
@@ -1529,6 +1658,9 @@ if has_input:
             "markmap_md": markmap_md,
             "summary_html": summary_html,
             "summary_data": summary_data,
+            "coverage": coverage_info,
+            "cost_estimate": cost_info,
+            "segments_count": len(all_segments),
             "has_material": combined_material is not None,
             "source_label": source_label,
             "youtube_url": youtube_url.strip() if source_type == "🎬 YouTube URL" else "",
