@@ -455,7 +455,8 @@ def assemble_full(about: str, overview: str, chapters: list[str],
                   terms: list[str], numbers: list[str], laws: list[str],
                   cov: dict, gaps: list[dict] | None,
                   next_steps: str = "", source_note: str = "",
-                  no_heading: list[int] | None = None) -> str:
+                  no_heading: list[int] | None = None,
+                  num_found: dict | None = None) -> str:
     """★決められた順に組み立てる。本編は連結するだけ（要約しない）。"""
     parts = ["# 講演の記録", ""]
     parts += ["## 1. この記録について", "",
@@ -476,6 +477,8 @@ def assemble_full(about: str, overview: str, chapters: list[str],
     parts += [laws_section(laws), ""]
     parts += [terms_section(terms), ""]
     parts += [gaps_section(gaps or []), ""]
+    if num_found is not None:
+        parts += [numbers_check_section(num_found, chapters), ""]
     parts += [coverage_section(cov), ""]
     if next_steps:
         parts += ["## 事務所として次に確かめること", "", next_steps.strip(), ""]
@@ -514,3 +517,121 @@ def estimate_whisper_jpy(minutes: float, db_path=None) -> dict:
             "price_source": api_prices.PRICE_SOURCE,
             "price_checked_on": api_prices.PRICE_CHECKED_ON,
             "is_estimate": True}
+
+
+def compression_note(info: dict) -> str:
+    """★音質を落としたなら、落としたことをレポートに書く。
+
+    2026-08-21 追加。それまでは全体を 32kbps へ再エンコードしてから分割しており、
+    ★落としたこと自体がどこにも残らなかった。
+    """
+    n = len(info.get("compressed") or [])
+    total = info.get("chunks") or 0
+    if not n:
+        return ""
+    return ("★音声の %d区画中 %d区画（%s）は上限（24MB）を超えたため、"
+            "32kbps に圧縮してから認識しています。その区画は音質が落ちています。"
+            % (total, n, ", ".join("区画%d" % i for i in info["compressed"])))
+
+
+# ── 本文に数値が残っていないかを機械的に見る ────────────────────
+#
+#   ★2026-08-21 実測: 「日付・数値は本文に書かない」と指示しても守られなかった。
+#     35行に数字が残り、内訳は タイムスタンプの写し込み14行 / 日付2行 /
+#     条文番号7行 / ★用語に含まれる数字4行 / その他8行 だった。
+#     しかも「（→日付・数値の一覧）」という参照は★0回。
+#   ★指示を厳しくするだけでは足りない。出た物を数えて表に出す。
+
+#: ★これは「数値」ではなく用語の一部。書いてよい（書きようがない）。
+#  第2種社会福祉事業 / 9条列挙行為 / 3類型 / 2本柱 / 2段構え など。
+TERM_DIGIT = re.compile(
+    r"第\s*[0-9０-９]+\s*種|[0-9０-９]+\s*条列挙行為|[0-9０-９]+\s*類型"
+    r"|[0-9０-９]+\s*本柱|[0-9０-９]+\s*段構え|[0-9０-９]+\s*号行為")
+
+#: ★本文から外すべきもの。
+PAT_DATE = re.compile(r"令和\s*[0-9０-９]+\s*年|[0-9０-９]+\s*月\s*[0-9０-９]+\s*日")
+PAT_ARTICLE = re.compile(r"[0-9０-９]+\s*条(?!列挙)")
+PAT_TIMESTAMP = re.compile(r"\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]")
+
+
+def numbers_in_body(text: str) -> dict:
+    """★本文に残っている数値を種類ごとに数える。
+
+    ★用語に含まれる数字（第2種・3類型など）は数えない。書きようがないため。
+    返す: {"date": [...], "article": [...], "timestamp": [...], "total": n}
+    """
+    out = {"date": [], "article": [], "timestamp": []}
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if not s or s.startswith("**"):
+            continue
+        if PAT_TIMESTAMP.search(s):
+            out["timestamp"].append(s[:60])
+        masked = TERM_DIGIT.sub("", PAT_TIMESTAMP.sub("", s))
+        if PAT_DATE.search(masked):
+            out["date"].append(s[:60])
+        elif PAT_ARTICLE.search(masked):
+            out["article"].append(s[:60])
+    out["total"] = sum(len(v) for k, v in out.items() if k != "total")
+    return out
+
+
+#: ★数値を本文から外したときに、章に残すべき参照。
+REF_MARK = "→日付・数値の一覧"
+
+
+def numbers_check_section(found: dict, chapters: list[str]) -> str:
+    """★本文に数値が残っていたら、レポート自身に出す。黙って通さない。
+
+    ★破綻点への手当ても兼ねる: 数値を外したのに参照も無い章は、
+      章だけを読んでも「いつから」が分からない。その数も出す。
+    """
+    refs = sum(1 for c in chapters if REF_MARK in (c or ""))
+    lines = ["## 本文の数値の点検", "",
+             "★数値は「日付・数値の一覧」に集める決まり。"
+             "本文に残っていれば二重管理になるので、ここで数えている。", "",
+             "| 種類 | 残っている行数 |", "|---|---|",
+             "| 日付 | %d |" % len(found["date"]),
+             "| 条文番号 | %d |" % len(found["article"]),
+             "| 文字起こしの時刻の写し込み | %d |" % len(found["timestamp"]),
+             "| 章に付いた「一覧参照」 | %d / %d章 |" % (refs, len(chapters))]
+    if found["total"] == 0:
+        lines += ["", "★本文に日付・条文番号・時刻は残っていません。"]
+    else:
+        lines += ["", "★本文に数値が %d行 残っています（下記は先頭のみ）。"
+                  % found["total"]]
+        for k, label in (("date", "日付"), ("article", "条文番号"),
+                         ("timestamp", "時刻")):
+            for s in found[k][:3]:
+                lines.append("- %s: %s" % (label, s))
+    if not refs and chapters:
+        lines += ["", "★どの章にも「一覧参照」がありません。"
+                  "数値を外した章は、章だけを読むと「いつから」が分かりません。"]
+    return "\n".join(lines)
+
+
+#: ★レポート生成時に渡す「誤変換の対応表」。音声認識用の語彙とは役割が違う。
+CORRECTION_FILES = ("vocab/corrections_ja.txt",)
+
+
+def load_corrections(base_dir: Path, files=CORRECTION_FILES,
+                     extra_path: str = "") -> list[str]:
+    """★対応表を外のファイルから読む（コードに書かない・あとから足せる）。
+
+    ★機械的に置換しない。文脈を見てモデルが直す材料として渡すだけ。
+      「公権力」のように本当にその語である場合まで潰さないため。
+    """
+    rows: list[str] = []
+    paths = [Path(base_dir) / f for f in files]
+    if extra_path:
+        paths.append(Path(extra_path))
+    for p in paths:
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except Exception:                                    # noqa: BLE001
+            continue
+        for line in raw.splitlines():
+            t = line.strip()
+            if t and not t.startswith("#") and "→" in t and t not in rows:
+                rows.append(t)
+    return rows

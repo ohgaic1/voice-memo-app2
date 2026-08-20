@@ -71,6 +71,13 @@ VOCAB_TERMS = RB.load_vocab(Path(__file__).resolve().parent,
                             extra_path=os.environ.get("VOCAB_FILE", ""))
 VOCAB_PROMPT, VOCAB_USED, VOCAB_DROPPED = RB.whisper_prompt(VOCAB_TERMS)
 
+# ★レポート生成に渡す誤変換の対応表（音声認識用の語彙とは役割が違う）。
+#   2026-08-21 実測: 文字起こし段では語彙を渡しても 公権45回 が直らず、
+#   レポート段で 138→18 まで減った。残りを減らすための材料。
+#   ★機械的に置換はしない。文脈を見てモデルが直す。
+CORRECTIONS = RB.load_corrections(Path(__file__).resolve().parent,
+                                  extra_path=os.environ.get("CORRECTIONS_FILE", ""))
+
 load_env()
 
 # ─────────────────────────────────────────
@@ -245,98 +252,102 @@ def _segments_of(resp) -> list:
 
 
 def transcribe_audio(file_path, api_key, vocab_prompt: str = ""):
-    """音声ファイルを文字起こし（大容量対応）。返す: (時刻付き本文, セグメント)。
+    """音声を文字起こしする。返す: (時刻付き本文, セグメント, 経過の記録)。
 
     ★2026-08-20 追加。どちらも★渡すだけ・受け取るだけで、費用は変わらない。
       ・vocab_prompt … 分野語彙のヒント。whisper が受け付けるのに渡していなかった。
-        実測: 渡さなかった 2026-08-20 の講演で 70組以上の誤変換が出た。
       ・response_format="verbose_json" … 時刻付きのセグメントが返る。
         これで章や欠落の位置を★時刻で言えるようになる。
+
+    ★2026-08-21 変更。それまでは「まるごと圧縮 → それでも大きければ分割」だった。
+      2時間の音声では 69kbps → 32kbps へ★全体を再エンコードしてから分割しており、
+      分割すれば1区画あたり上限を下回るのに、無駄に音質を落としていた。
+      ★いまは「先に分割 → 上限を超える区画だけ圧縮」にする。
+      圧縮した区画があれば、それが何本かを★記録してレポートに書く
+      （黙って音質を落とさないため）。
+
+    ★2026-08-21 の実測メモ: 圧縮の有無で認識の質に有意な差は見られなかった
+      （誤変換語の合計 166 vs 190・方向はむしろ圧縮側が良い／スペクトルの
+       95%帯域 1770Hz vs 1777Hz）。それでも★不要な再エンコードはしない。
+      得るものが無く、失うもの（時間と音質）があるため。
     """
     client = OpenAI(api_key=api_key)
     max_size = 24 * 1024 * 1024
-    
+    info = {"chunks": 0, "compressed": [], "note": ""}
+
     try:
-        # ファイルサイズチェック
         size = os.path.getsize(file_path)
-        work_path = file_path
-        
-        # 圧縮が必要な場合
-        if size > max_size:
-            st.info("  🔧 圧縮中...")
-            # 拡張子を.mp3に統一
-            base = os.path.splitext(file_path)[0]
-            comp = f"{base}_comp.mp3"
-            if not compress_audio(file_path, comp):
-                return None
-            work_path = comp
-            size = os.path.getsize(work_path)
-        
-        # まだ大きければ分割
-        if size > max_size:
-            st.info("  ✂️ 分割中...")
-            chunks = split_audio(work_path)
-            if not chunks:
-                return None
-            
-            texts = []
-            all_segments = []
-            pb = st.progress(0)
-            for i, chunk in enumerate(chunks):
-                with open(chunk, "rb") as f:
-                    with api_usage.record(app=USAGE_APP, site="transcribe.chunk",
-                                          provider="openai",
-                                          operation="audio.transcriptions",
-                                          model="whisper-1") as _rec:
-                        resp = client.audio.transcriptions.create(
-                            model="whisper-1",
-                            file=f,
-                            language="ja",
-                            prompt=vocab_prompt or "",
-                            response_format="verbose_json",
-                        )
-                        _rec.sdk_response(resp)
-                    segs = _segments_of(resp)
-                    off = i * 600            # split_audio の1区画は600秒
-                    all_segments.extend(
-                        dict(sg, start=float(sg.get("start", 0)) + off,
-                             end=float(sg.get("end", 0)) + off) for sg in segs)
-                    texts.append(RB.timestamped_text(segs, offset_sec=off)
-                                 or getattr(resp, "text", ""))
-                pb.progress((i + 1) / len(chunks))
-                os.remove(chunk)
-            
-            # 圧縮ファイルを削除
-            if work_path != file_path and os.path.exists(work_path):
-                os.remove(work_path)
-            
-            return "\n".join(texts).strip(), all_segments
-        
-        # 通常サイズ → そのまま文字起こし
-        with open(work_path, "rb") as f:
-            with api_usage.record(app=USAGE_APP, site="transcribe.single",
-                                  provider="openai",
-                                  operation="audio.transcriptions",
-                                  model="whisper-1") as _rec:
-                resp = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    language="ja",
-                    prompt=vocab_prompt or "",
-                    response_format="verbose_json",
-                )
-                _rec.sdk_response(resp)
-        
-        # 圧縮ファイルを削除
-        if work_path != file_path and os.path.exists(work_path):
-            os.remove(work_path)
-        
-        segs = _segments_of(resp)
-        return (RB.timestamped_text(segs) or getattr(resp, "text", "")), segs
+
+        # ── 上限内ならそのまま1回で ──
+        if size <= max_size:
+            info["chunks"] = 1
+            with open(file_path, "rb") as f:
+                with api_usage.record(app=USAGE_APP, site="transcribe.single",
+                                      provider="openai",
+                                      operation="audio.transcriptions",
+                                      model="whisper-1") as _rec:
+                    resp = client.audio.transcriptions.create(
+                        model="whisper-1", file=f, language="ja",
+                        prompt=vocab_prompt or "",
+                        response_format="verbose_json")
+                    _rec.sdk_response(resp)
+            segs = _segments_of(resp)
+            return ((RB.timestamped_text(segs) or getattr(resp, "text", "")),
+                    segs, info)
+
+        # ── ★先に分割する（原音のまま）──
+        st.info("  ✂️ 分割中...")
+        chunks = split_audio(file_path)
+        if not chunks:
+            return None, [], info
+        info["chunks"] = len(chunks)
+
+        texts = []
+        all_segments = []
+        pb = st.progress(0)
+        for i, chunk in enumerate(chunks):
+            work = chunk
+            tmp_comp = None
+            # ★上限を超える区画だけ圧縮する。超えていなければ触らない。
+            if os.path.getsize(chunk) > max_size:
+                tmp_comp = os.path.splitext(chunk)[0] + "_comp.mp3"
+                if not compress_audio(chunk, tmp_comp):
+                    st.error("  ❌ 区画%d の圧縮に失敗しました" % i)
+                    os.remove(chunk)
+                    continue
+                work = tmp_comp
+                info["compressed"].append(i)
+
+            with open(work, "rb") as f:
+                with api_usage.record(app=USAGE_APP, site="transcribe.chunk",
+                                      provider="openai",
+                                      operation="audio.transcriptions",
+                                      model="whisper-1") as _rec:
+                    resp = client.audio.transcriptions.create(
+                        model="whisper-1", file=f, language="ja",
+                        prompt=vocab_prompt or "",
+                        response_format="verbose_json")
+                    _rec.sdk_response(resp)
+            segs = _segments_of(resp)
+            off = i * 600            # split_audio の1区画は600秒
+            all_segments.extend(
+                dict(sg, start=float(sg.get("start", 0)) + off,
+                     end=float(sg.get("end", 0)) + off) for sg in segs)
+            texts.append(RB.timestamped_text(segs, offset_sec=off)
+                         or getattr(resp, "text", ""))
+            pb.progress((i + 1) / len(chunks))
+            os.remove(chunk)
+            if tmp_comp and os.path.exists(tmp_comp):
+                os.remove(tmp_comp)
+
+        info["note"] = RB.compression_note(info)
+        if info["compressed"]:
+            st.warning("⚠️ " + info["note"])
+        return "\n".join(texts).strip(), all_segments, info
 
     except Exception as e:
         st.error(f"文字起こしエラー: {e}")
-        return None, []
+        return None, [], info
 
 
 # ═══════════════════════════════════════════
@@ -460,8 +471,8 @@ def _youtube_whisper_fallback(url: str, video_id: str) -> tuple:
             api_key = st.session_state.get("api_key", "")
             if not api_key:
                 return None, "音声ダウンロード成功しましたが OpenAI API キーがないため Whisper 文字起こしができません"
-            transcript, _segs = transcribe_audio(audio_path, api_key,
-                                                 VOCAB_PROMPT)
+            transcript, _segs, _info = transcribe_audio(audio_path, api_key,
+                                                        VOCAB_PROMPT)
             if transcript:
                 st.success(f"✅ Whisper フォールバック成功（{len(transcript):,}文字）")
                 return transcript, video_id
@@ -945,17 +956,29 @@ _CHUNK_TEMPLATE = """以下は、ある講演の文字起こしの★一部（�
 
 1. ★この文章は音声認識の出力で、法律用語が高い確率で誤変換されている。
    配付資料と突き合わせて正しい法令用語に直すこと。
+{corrections}
    直したものは下の「用語の訂正」に「直す前 → 直した後」で必ず記録する。
 2. ★どう直せばよいか分からないものは直さず、
    【聞き取り不確か：〜】と印を付けて残す。★自然な言葉に置き換えない。
-3. ★日付・数値・条文番号は本文に書かない。下の一覧にだけ書く。
-   本文では「（→日付・数値の一覧）」のように参照する。
-4. ★聞き取れなかった箇所には【聞き取り不確か：〜】の印を付ける。
-   本文の行頭に [HH:MM:SS] が付いているので、位置も書ける。
-5. ★一つの章に複数の主題を混ぜない。主題が変われば章を分ける。
+3. ★次のものは本文に書かない。下の一覧にだけ書く。
+   ・日付（令和○年○月、○月○日 など）
+   ・条文番号（○条、○条の○ など）
+   ・金額・件数・割合
+   本文では★「（→日付・数値の一覧）」と書いて参照する。
+   ★ただし次は「数値」ではなく用語の一部なので、そのまま本文に書いてよい:
+     第2種社会福祉事業／9条列挙行為／3類型／2本柱／2段構え／各号行為
+   ★2026-08-21 実測: この指示を守れず、本文に日付2行・条文番号5行が残った。
+     残っていれば機械的に数えてレポートに出る。
+4. ★本文に [HH:MM:SS] の時刻を書き写さない。
+   本文の行頭に付いているのは位置を知るための印であって、本文の一部ではない。
+   時刻を書いてよいのは【聞き取り不確か：〜】の印を付けるときだけ。
+   ★2026-08-21 実測: 時刻をそのまま写した行が14行あった。
+5. ★聞き取れなかった箇所には【聞き取り不確か：〜】の印を付ける。
+   ここでだけ時刻を書いてよい。
+6. ★一つの章に複数の主題を混ぜない。主題が変われば章を分ける。
    ★章の数を気にしない。分けるべきなら分ける。
-6. ★この区間の最後まで扱う。途中で「以下略」としない。
-7. 前置きや締めの文は書かない。
+7. ★この区間の最後まで扱う。途中で「以下略」としない。
+8. 前置きや締めの文は書かない。
 
 ■ 章の後ろに、次の3つを必ず付けること（★該当が無ければ「なし」の1行）
 
@@ -995,9 +1018,14 @@ def generate_chunk_chapters(chunk, i, n, material_text, api_key):
     if material_text and material_text.strip():
         mat = ("\n【配付資料（用語・固有名詞の表記はこちらに合わせる）】\n"
                + material_text[:MAX_MATERIAL_CHARS] + "\n")
+    corr = ""
+    if CORRECTIONS:
+        corr = ("   ★この講演でよく出る誤変換の対応表（★機械的に置換せず、"
+                "文脈を見て判断すること）:\n"
+                + "\n".join("     " + c for c in CORRECTIONS))
     prompt = _CHUNK_TEMPLATE.format(
         i=i + 1, n=n, context=chunk.context or "（なし）",
-        body=chunk.body, material=mat)
+        body=chunk.body, material=mat, corrections=corr)
     try:
         with api_usage.record(app=USAGE_APP, site="report.chunk",
                               provider="openai", operation="chat.completions",
@@ -1116,7 +1144,8 @@ def generate_next_steps(titles, laws, api_key):
 
 
 def generate_report_full(transcript, file_labels, material_text, api_key,
-                         segments=None, title="", allow_over_limit=False):
+                         segments=None, title="", allow_over_limit=False,
+                         audio_notes=None):
     """★全文を区画に分けて読み、章を連結してレポートにする。
 
     ★ここで要約はしない。区画の出力をそのまま連結する。
@@ -1179,13 +1208,24 @@ def generate_report_full(transcript, file_labels, material_text, api_key,
     laws = RB.merge_rows(parsed, "laws")
     titles = RB.chapter_titles(chapters)
 
+    # ★本文に数値が残っていないかを機械的に数える。指示だけでは守られない
+    #   ことが 2026-08-21 の実測で分かっているので、出た物を表に出す。
+    num_found = RB.numbers_in_body("\n".join(chapters))
+    if num_found["total"]:
+        st.warning("★本文に数値が %d行 残っています（日付%d・条文番号%d・時刻%d）。"
+                   "レポートの「本文の数値の点検」に出しています。"
+                   % (num_found["total"], len(num_found["date"]),
+                      len(num_found["article"]), len(num_found["timestamp"])))
+
     about = generate_about(material_text, file_labels, api_key)
     overview = generate_overview(titles, api_key)
     next_steps = generate_next_steps(titles, laws, api_key)
     gaps = RB.silent_gaps(segments) if segments else []
-    note = material_note or ""
+    note = "\n\n".join([x for x in (audio_notes or []) if x]
+                        + ([material_note] if material_note else []))
     return RB.assemble_full(about, overview, chapters, terms, numbers, laws,
-                            cov, gaps, next_steps, note, no_heading), cov, est
+                            cov, gaps, next_steps, note, no_heading,
+                            num_found), cov, est
 
 
 # ═══════════════════════════════════════════
@@ -1655,6 +1695,8 @@ if has_input:
         transcripts_per_file = {}
         # ★時刻付きセグメント。音声以外の入力では空のまま（無い物を作らない）。
         all_segments = []
+        # ★音質を落としたなど、レポートに残すべき経過。
+        audio_notes = []
         source_label = "音声"  # Notion保存用
 
         if source_type == "🎵 音声ファイル":
@@ -1682,10 +1724,12 @@ if has_input:
                                      "超えました。★実行していません。"
                                      % (we["jpy"], we["limit_jpy"]))
                             st.stop()
-                    tr, segs = transcribe_audio(
+                    tr, segs, tinfo = transcribe_audio(
                         tmp_path, st.session_state.api_key, VOCAB_PROMPT)
                 if tr:
                     all_segments.extend(segs or [])
+                    if tinfo.get("note"):
+                        audio_notes.append(tinfo["note"])
                     transcripts_per_file[audio_file.name] = tr
                     st.success(f"  ✅ 完了（{len(tr):,}文字）")
                 else:
@@ -1765,6 +1809,7 @@ if has_input:
                 report, coverage_info, cost_info = generate_report_full(
                     combined_transcript, file_labels, combined_material,
                     st.session_state.api_key, segments=all_segments,
+                    audio_notes=audio_notes,
                     allow_over_limit=st.session_state.get("allow_over_limit", False),
                 )
         except RB.CostLimitExceeded as e:
