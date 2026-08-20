@@ -329,3 +329,188 @@ def chapter_titles(chapters: list[str]) -> list[str]:
             if t and t not in out:
                 out.append(t)
     return out
+
+
+# ── 区画の出力を機械的に読み取る（★ここで LLM を使わない）──────────
+#
+#   ★区画ごとに作るのは「本文を読まないと作れないもの」だけにする。
+#     区画をまたいで揃えるだけのもの（一覧）は、★機械的に連結する。
+#     LLM を通す回数を最小にして、再要約の余地を作らないため。
+
+#: 区画の出力の中で、章の後ろに置く一覧の区切り。
+MARK_TERMS = "<<<用語の訂正>>>"
+MARK_NUMS = "<<<日付・数値>>>"
+MARK_LAWS = "<<<条文・法令>>>"
+MARKS = (MARK_TERMS, MARK_NUMS, MARK_LAWS)
+
+
+#: ★指示文の見出しをそのまま書き写してくることがある（2026-08-20 実測）。
+#  「事項 | 値 | 明確 or 推定 or 不確か」がそのまま1行目に入っていた。
+_HEADER_WORDS = ("明確 or 推定", "直す前 → 直した後", "直す前 →",
+                 "法令名 | 条", "事項 | 値")
+
+
+def _is_header_row(t: str) -> bool:
+    return any(w in t for w in _HEADER_WORDS)
+
+
+def _is_noop_correction(t: str) -> bool:
+    """★「特定補助 → 特定補助」のように直っていない行を落とす。
+
+    2026-08-20 実測: 訂正一覧に、左右が同じ行が混ざっていた。
+    訂正していないものを訂正として数えると、件数が嘘になる。
+    """
+    for arrow in ("→", "->", "⇒"):
+        if arrow in t:
+            a, _, b = t.partition(arrow)
+            if a.strip() and a.strip() == b.strip():
+                return True
+    return False
+
+
+def parse_chunk_output(text: str) -> dict:
+    """★区画の出力を、章の本文と3つの一覧に分ける。
+
+    返す: {"chapters": str, "terms": [...], "numbers": [...], "laws": [...]}
+    ★印が無ければ空の一覧にする（無い物を作らない）。
+    """
+    s = text or ""
+    pos = [(s.find(m), m) for m in MARKS if s.find(m) >= 0]
+    pos.sort()
+    chapters = s[:pos[0][0]].strip() if pos else s.strip()
+    out = {"chapters": chapters, "terms": [], "numbers": [], "laws": []}
+    key = {MARK_TERMS: "terms", MARK_NUMS: "numbers", MARK_LAWS: "laws"}
+    for i, (p, m) in enumerate(pos):
+        end = pos[i + 1][0] if i + 1 < len(pos) else len(s)
+        body = s[p + len(m):end]
+        rows = []
+        for line in body.splitlines():
+            t = line.strip().lstrip("-・ ").strip()
+            if not t or t.startswith("|--") or t in ("なし", "（なし）"):
+                continue
+            if t.startswith("|"):
+                t = t.strip("|").strip()
+            if _is_header_row(t) or _is_noop_correction(t):
+                continue          # ★見出しの写しと、直していない行は落とす
+            rows.append(t)
+        out[key[m]] = rows
+    return out
+
+
+def merge_rows(parsed: list[dict], key: str) -> list[str]:
+    """★区画をまたいで一覧を揃える。順序は出てきた順、重複は落とすだけ。"""
+    seen, out = set(), []
+    for p in parsed:
+        for r in p.get(key) or []:
+            k = r.replace(" ", "").replace("　", "")
+            if k not in seen:
+                seen.add(k)
+                out.append(r)
+    return out
+
+
+def chapters_missing_heading(parsed: list[dict], results) -> list[int]:
+    """★破綻点の検知: 章の見出しが1つも無い区画を拾う。
+
+    プロンプトを変えたときに出力が章の形から外れても、連結すれば
+    ★見た目は通ってしまう。読了率は 100% のままなので気づけない。
+    """
+    bad = []
+    for r, p in zip(results, parsed):
+        if not getattr(r, "ok", False):
+            continue
+        if not _HEADING.search(p.get("chapters") or ""):
+            bad.append(r.index)
+    return bad
+
+
+def terms_section(rows: list[str]) -> str:
+    if not rows:
+        return "## 用語の訂正\n\nなし（訂正した用語はありません）。"
+    return "\n".join(["## 用語の訂正", "",
+                      "音声認識の誤変換を配付資料と突き合わせて直したもの。", "",
+                      "| 直す前 → 直した後 |", "|---|"]
+                     + ["| %s |" % r for r in rows])
+
+
+def numbers_section(rows: list[str]) -> str:
+    if not rows:
+        return "## 日付・数値の一覧\n\nなし（日付・数値への言及はありません）。"
+    return "\n".join(["## 日付・数値の一覧", "",
+                      "★施行日・条文番号・法令名は法令DBとの突合前提。", "",
+                      "| 事項・値・確からしさ | 印 |", "|---|---|"]
+                     + ["| %s | ★要突合 |" % r for r in rows])
+
+
+def laws_section(rows: list[str]) -> str:
+    if not rows:
+        return "## 条文・法令への言及\n\nなし（条文・法令への言及はありません）。"
+    return "\n".join(["## 条文・法令への言及", "",
+                      "★聞き取りである以上、番号は誤りうる。すべて要突合。", "",
+                      "| 法令名・条・文脈 | 印 |", "|---|---|"]
+                     + ["| %s | ★要突合 |" % r for r in rows])
+
+
+def assemble_full(about: str, overview: str, chapters: list[str],
+                  terms: list[str], numbers: list[str], laws: list[str],
+                  cov: dict, gaps: list[dict] | None,
+                  next_steps: str = "", source_note: str = "",
+                  no_heading: list[int] | None = None) -> str:
+    """★決められた順に組み立てる。本編は連結するだけ（要約しない）。"""
+    parts = ["# 講演の記録", ""]
+    parts += ["## 1. この記録について", "",
+              (about or "不明").strip(), "",
+              "★この記録は講演の記録であり、条文そのものではありません。"
+              "条文・法令名・数値は必ず一次資料に当たってください。", ""]
+    if source_note:
+        parts += [source_note, ""]
+    parts += ["## 2. 全体像", "", (overview or "（生成できませんでした）").strip(), ""]
+    parts += ["## 3. 本編", ""]
+    for c in chapters:
+        if c and c.strip():
+            parts += [c.strip(), ""]
+    if no_heading:
+        parts += ["★次の区画は、章の形になっていない出力が混じっています: %s"
+                  % ", ".join("区画%d" % i for i in no_heading), ""]
+    parts += [numbers_section(numbers), ""]
+    parts += [laws_section(laws), ""]
+    parts += [terms_section(terms), ""]
+    parts += [gaps_section(gaps or []), ""]
+    parts += [coverage_section(cov), ""]
+    if next_steps:
+        parts += ["## 事務所として次に確かめること", "", next_steps.strip(), ""]
+    return "\n".join(parts).rstrip() + "\n"
+
+
+#: ★章が他の章を参照している疑いのある語。知識ベースで章だけ読むと意味が通らなくなる。
+CROSS_REF_WORDS = ("前述の", "上記の", "先ほどの", "前章", "既述の", "後述の")
+
+
+def cross_reference_hits(chapters: list[str]) -> list[tuple[int, str]]:
+    """★章が他の章を参照していないかを見る。返す: [(章の番号, 見つかった語)]。
+
+    ★この記録は知識ベースに入り、章だけが引かれる。
+      「前述のとおり」と書かれていると、その章だけでは意味が通らない。
+    """
+    hits = []
+    for i, c in enumerate(chapters):
+        for w in CROSS_REF_WORDS:
+            if w in (c or ""):
+                hits.append((i, w))
+    return hits
+
+
+def estimate_whisper_jpy(minutes: float, db_path=None) -> dict:
+    """★音声認識の見込み額。分あたりの単価は api_prices が持っている。
+
+    ★2026-08-20 追加。それまで関所はレポート生成の分しか見ておらず、
+      文字起こしの費用が「1回あたり」から漏れていた。
+    """
+    rate, on, src = api_prices.usd_jpy(db_path)
+    usd = minutes * api_prices.WHISPER_USD_PER_MIN
+    return {"minutes": minutes, "usd": usd, "jpy": usd * rate,
+            "usd_jpy": rate, "usd_jpy_on": on, "usd_jpy_src": src,
+            "limit_jpy": COST_LIMIT_JPY, "over_limit": usd * rate > COST_LIMIT_JPY,
+            "price_source": api_prices.PRICE_SOURCE,
+            "price_checked_on": api_prices.PRICE_CHECKED_ON,
+            "is_estimate": True}

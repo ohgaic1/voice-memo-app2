@@ -218,6 +218,18 @@ def split_audio(input_path, chunk_sec=600):
         return []
 
 
+def _audio_minutes(path) -> float:
+    """★音声の長さ（分）。取れなければ 0 を返す（推測しない）。"""
+    try:
+        r = subprocess.run(
+            [_ffprobe(), "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=True)
+        return float(r.stdout.strip()) / 60.0
+    except Exception:                                        # noqa: BLE001
+        return 0.0
+
+
 def _segments_of(resp) -> list:
     """★verbose_json の segments を辞書の一覧で取り出す。
 
@@ -887,35 +899,92 @@ def save_to_notion_kenshu(
 # GPT：全文を読んでレポートを作る（★抜き取らない）
 # ═══════════════════════════════════════════
 _CHUNK_SYSTEM = (
-    "あなたは講演・会議の記録係です。渡された文字起こしの区間を、"
-    "★要約せずに章立てして書き起こします。渡された範囲の内容だけを使い、"
-    "知識で補いません。分からないものは「不明」と書きます。"
+    "あなたは行政書士事務所の記録係です。渡された文字起こしの区間を、"
+    "★要約せずに章立てして書き起こします。"
+    "★渡された範囲に書かれていることだけを使い、知識で補いません。"
+    "★分からないものは「不明」「言及なし」と書き、空欄にしません。"
 )
 
-_CHUNK_TEMPLATE = """以下は、ある録音の文字起こしの★一部（区間 {i}/{n}）です。
-この区間に出てくる話題を、論点ごとに章に分けて書いてください。
+# ★章数の目安は書かない（2026-08-20 に撤回）。
+#   実測で2時間の講演に24章が妥当と分かっている。数を目安に合わせるために
+#   主題を混ぜると、知識ベースで章が引けなくなる。★数は結果に任せる。
+_CHUNK_TEMPLATE = """以下は、ある講演の文字起こしの★一部（区間 {i}/{n}）です。
+この区間で語られたことを、論点ごとに章に分けて書いてください。
 
 【この区間の直前（文脈のためだけに渡します。★ここから章を作らないこと）】
 {context}
 
-【この区間の本文（★ここを全部読んで章にする）】
+【この区間の本文（★ここを最初から最後まで全部読んで章にする）】
 {body}
 {material}
 ---
-出力の決まり:
-- 見出しは `### 【主題】` の形。★他の区間を参照しない（その章だけで意味が通るように）
-- 各章に次を書く:
-  **何が語られたか**（要約せずに、話の筋・理由・背景を落とさず）
-  **講師が述べた根拠・理由**
-  **具体例・数字**（無ければ「なし」）
-  **言い切られていないこと**（断定していない部分。★ここを落とさない）
-- ★文字起こしに無いことを足さない。知識で埋めない
-- ★区間の最後まで扱うこと。途中で「以下略」としない
-- 前置きや締めの文は書かない。章だけを出力する"""
+■ 各章の形（★この順で、見出しも含めてそのまま使うこと）
+
+### 【主題】
+主題は★名詞。この章が何の話かを表す。★他の章を参照しない
+（「前述の」「上記の」「先ほどの」を使わない）。
+
+**何が変わるのか／何が論点か**
+★要約しない。話の筋・理由・背景を落とさずに書く。
+
+**講師が述べた根拠・理由**
+なぜそうなるのか。制度趣旨、立法の背景、実務上の必要性など。
+
+**実務でどう効くか**
+事務所の業務（相続・後見・許認可・医療介護）にどう関わるか。
+★語られていなければ「言及なし」と書く。推測で埋めない。
+
+**講師が示した具体例**
+例示があればそのまま。無ければ「なし」。
+
+**言い切られていないこと**
+「〜と思われる」「今後の議論」など、講師が断定しなかった部分。
+★ここを落とさない。断定に変えない。
+
+■ ★守ること
+
+1. ★この文章は音声認識の出力で、法律用語が高い確率で誤変換されている。
+   配付資料と突き合わせて正しい法令用語に直すこと。
+   直したものは下の「用語の訂正」に「直す前 → 直した後」で必ず記録する。
+2. ★どう直せばよいか分からないものは直さず、
+   【聞き取り不確か：〜】と印を付けて残す。★自然な言葉に置き換えない。
+3. ★日付・数値・条文番号は本文に書かない。下の一覧にだけ書く。
+   本文では「（→日付・数値の一覧）」のように参照する。
+4. ★聞き取れなかった箇所には【聞き取り不確か：〜】の印を付ける。
+   本文の行頭に [HH:MM:SS] が付いているので、位置も書ける。
+5. ★一つの章に複数の主題を混ぜない。主題が変われば章を分ける。
+   ★章の数を気にしない。分けるべきなら分ける。
+6. ★この区間の最後まで扱う。途中で「以下略」としない。
+7. 前置きや締めの文は書かない。
+
+■ 章の後ろに、次の3つを必ず付けること（★該当が無ければ「なし」の1行）
+
+<<<用語の訂正>>>
+直す前 → 直した後
+（この区間で直したものを1行ずつ）
+
+<<<日付・数値>>>
+事項 | 値 | 明確 or 推定 or 不確か
+（この区間に出た日付・数値・条文番号を1行ずつ。確からしさを3段階で）
+
+<<<条文・法令>>>
+法令名 | 条 | どういう文脈で出たか
+（この区間で挙がった法令名と条文番号を1行ずつ）"""
 
 _OVERVIEW_SYSTEM = (
     "あなたは記録係です。★章の見出しだけを見て、全体像を書きます。"
     "見出しに無いことを足しません。"
+)
+
+_ABOUT_SYSTEM = (
+    "あなたは記録係です。★配付資料に書かれていることだけから、"
+    "その講演の題名・日時・講師・主催を書き出します。"
+    "★書かれていない項目は「不明」と書きます。推測しません。"
+)
+
+_NEXT_SYSTEM = (
+    "あなたは行政書士事務所の記録係です。★章の見出しと条文の一覧だけを見て、"
+    "一次資料に当たるべきものを挙げます。★講演で語られていない推測は書きません。"
 )
 
 
@@ -984,6 +1053,68 @@ def generate_overview(titles, api_key):
         return ""
 
 
+def generate_about(material_text, file_labels, api_key):
+    """★題名・日時・講師。材料は配付資料だけ（本編を渡さない）。"""
+    if not (material_text or "").strip():
+        return "題名／日時／講師：不明（配付資料が渡されていません）"
+    client = OpenAI(api_key=api_key)
+    try:
+        with api_usage.record(app=USAGE_APP, site="report.about",
+                              provider="openai", operation="chat.completions",
+                              model="gpt-4o") as _rec:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _ABOUT_SYSTEM},
+                    {"role": "user", "content":
+                        "次は、ある講演の配付資料から取り出した文字です。"
+                        "題名／日時／講師／主催／配付資料 を箇条書きで"
+                        "書き出してください。★書かれていない項目は「不明」と"
+                        "書いてください。\n\n" + material_text[:MAX_MATERIAL_CHARS]},
+                ],
+                temperature=0.0,
+                max_tokens=600,
+            )
+            _rec.sdk_response(resp)
+        return resp.choices[0].message.content or "不明"
+    except Exception as e:                                   # noqa: BLE001
+        st.warning(f"⚠️ 「この記録について」の生成に失敗しました: {e}")
+        return "不明（生成に失敗しました）"
+
+
+def generate_next_steps(titles, laws, api_key):
+    """★次に確かめること。材料は章の見出しと条文の一覧だけ。"""
+    if not titles and not laws:
+        return ""
+    client = OpenAI(api_key=api_key)
+    try:
+        with api_usage.record(app=USAGE_APP, site="report.next_steps",
+                              provider="openai", operation="chat.completions",
+                              model="gpt-4o") as _rec:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _NEXT_SYSTEM},
+                    {"role": "user", "content":
+                        "次は、ある講演のレポートの章の見出しと、"
+                        "講演で挙がった条文・法令の一覧です。"
+                        "事務所として一次資料（条文・通知・パブコメ等）に"
+                        "当たるべきものを箇条書きで挙げてください。"
+                        "★ここに無いことは書かないでください。\n\n"
+                        "【章の見出し】\n" + "\n".join("- " + t for t in titles)
+                        + "\n\n【条文・法令】\n"
+                        + ("\n".join("- " + l for l in laws) or "（なし）")},
+                ],
+                temperature=0.2,
+                max_tokens=1200,
+            )
+            _rec.sdk_response(resp)
+        return resp.choices[0].message.content or ""
+    except Exception as e:                                   # noqa: BLE001
+        st.warning(f"⚠️ 「次に確かめること」の生成に失敗しました: {e}")
+        return ""
+
+
 def generate_report_full(transcript, file_labels, material_text, api_key,
                          segments=None, title="", allow_over_limit=False):
     """★全文を区画に分けて読み、章を連結してレポートにする。
@@ -1033,15 +1164,28 @@ def generate_report_full(transcript, file_labels, material_text, api_key,
         st.warning("★出力の上限で途中までになった区画: %s"
                    % ", ".join(str(i) for i in cov["truncated"]))
 
-    chapters = [r.text for r in results if r.ok and r.text.strip()]
-    overview = generate_overview(RB.chapter_titles(chapters), api_key)
-    gaps = RB.silent_gaps(segments) if segments else None
-    note = ("※ 音声認識の出力をもとにした記録です。条文・法令名・数値は"
-            "一次資料と突き合わせてください。")
-    if material_note:
-        note += "\n\n" + material_note
-    return RB.assemble(title or "／".join(file_labels), overview, chapters,
-                       cov, gaps, note), cov, est
+    # ★区画の出力を機械的に読み取る。一覧の統合に LLM を通さない。
+    parsed = [RB.parse_chunk_output(r.text if r.ok else "") for r in results]
+    chapters = [p["chapters"] for p, r in zip(parsed, results)
+                if r.ok and p["chapters"].strip()]
+    no_heading = RB.chapters_missing_heading(parsed, results)
+    if no_heading:
+        # ★破綻点の検知。連結すると見た目は通るので、ここで必ず出す。
+        st.error("★章の形になっていない区画があります: %s"
+                 % ", ".join("区画%d" % i for i in no_heading))
+
+    terms = RB.merge_rows(parsed, "terms")
+    numbers = RB.merge_rows(parsed, "numbers")
+    laws = RB.merge_rows(parsed, "laws")
+    titles = RB.chapter_titles(chapters)
+
+    about = generate_about(material_text, file_labels, api_key)
+    overview = generate_overview(titles, api_key)
+    next_steps = generate_next_steps(titles, laws, api_key)
+    gaps = RB.silent_gaps(segments) if segments else []
+    note = material_note or ""
+    return RB.assemble_full(about, overview, chapters, terms, numbers, laws,
+                            cov, gaps, next_steps, note, no_heading), cov, est
 
 
 # ═══════════════════════════════════════════
@@ -1525,6 +1669,19 @@ if has_input:
                     tmp_path = f.name
                     all_tmp_paths.append(tmp_path)
                 with st.spinner("  文字起こし中..."):
+                    # ★文字起こしの分も「1回あたり」に数える（2026-08-20）。
+                    #   ここを数えないと、関所が費用の一部しか見ないことになる。
+                    mins = _audio_minutes(tmp_path)
+                    if mins:
+                        we = RB.estimate_whisper_jpy(mins)
+                        st.info("🎧 文字起こしの見込み: %.0f円（%.1f分・$%.2f）"
+                                % (we["jpy"], we["minutes"], we["usd"]))
+                        if (we["over_limit"]
+                                and not st.session_state.get("allow_over_limit")):
+                            st.error("🛑 文字起こしだけで見込み %.0f円 が上限 %d円 を"
+                                     "超えました。★実行していません。"
+                                     % (we["jpy"], we["limit_jpy"]))
+                            st.stop()
                     tr, segs = transcribe_audio(
                         tmp_path, st.session_state.api_key, VOCAB_PROMPT)
                 if tr:
