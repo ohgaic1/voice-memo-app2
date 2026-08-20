@@ -214,3 +214,60 @@ def test_音声認識用と生成用で置き場が分かれている():
     assert (HERE / "vocab" / "corrections_ja.txt").is_file()
     # ★音声認識側に「→」の行が混ざっていないこと（混ざると語彙が壊れる）
     assert not any("→" in t for t in RB.load_vocab(HERE))
+
+
+# ── ⑤ ★訂正の裏取り（2026-08-21 2回目の実測）────────────────
+
+def test_元に無い訂正は落とす():
+    """★対応表を書き写しただけの行を、訂正として数えない。
+
+    実測 2026-08-21: 対応表29組すべてが訂正一覧に載ったが、うち5組
+    （原稿法 / 欠陥自由 / 新衣工研 / 大理研扶養 / 私護事務）は
+    ★文字起こしに1回も出ていなかった。
+    """
+    src = "公権と補佐について、任意貢献の話をした。"
+    rows = ["公権 → 後見", "任意貢献 → 任意後見", "私護事務 → 死後事務"]
+    keep, drop = RB.filter_corrections_by_source(rows, src)
+    assert keep == ["公権 → 後見", "任意貢献 → 任意後見"]
+    assert drop == ["私護事務 → 死後事務"], drop
+
+
+def test_括弧つきの注記があっても判定できる():
+    src = "日時を使っていますと。"
+    keep, drop = RB.filter_corrections_by_source(
+        ["日時（事業名として） → 日常生活自立支援事業"], src)
+    assert keep and not drop
+
+
+def test_裏取りを外すと嘘の件数が通る():
+    """★仕掛けの裏取り。落とさなければ、直していないものが数に入る。"""
+    src = "本文に何も無い。"
+    rows = ["私護事務 → 死後事務", "新衣工研 → 任意後見"]
+    keep, drop = RB.filter_corrections_by_source(rows, src)
+    assert keep == [] and len(drop) == 2, "★元に無い訂正を残している"
+
+
+def test_落とした分を呼び出し側が画面に出す():
+    body = ast.unparse(_fn("generate_report_full"))
+    assert "filter_corrections_by_source" in body, "★裏取りを呼んでいない"
+    assert "dropped_terms" in body and "st.warning" in body, (
+        "★落としたことを黙っている")
+
+
+def test_対応表に文脈依存の語を入れていない():
+    """★「移行」は正しい用法と誤りが同じ語。一律には直せない。
+
+    実測 2026-08-21: 本文の「移行」7回はすべて正しい用法だった。
+    """
+    rows = RB.load_corrections(HERE)
+    lefts = [r.split("→")[0].strip() for r in rows]
+    assert "移行" not in lefts, (
+        "★『移行』を対応表に入れています。"
+        "「新制度に移行する」まで潰れます（2026-08-21 実測）。")
+
+
+def test_2回目の実測で見つかった分が入っている():
+    rows = RB.load_corrections(HERE)
+    for r in ("全管注意義務 → 善管注意義務", "批判的な要件 → 規範的な要件",
+              "後概念 → 承継概念"):
+        assert r in rows, "★2回目の実測で残っていた分が足されていない: %s" % r

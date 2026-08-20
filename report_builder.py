@@ -635,3 +635,26 @@ def load_corrections(base_dir: Path, files=CORRECTION_FILES,
             if t and not t.startswith("#") and "→" in t and t not in rows:
                 rows.append(t)
     return rows
+
+
+def filter_corrections_by_source(rows: list[str], source: str) -> tuple[list, list]:
+    """★「直す前」が元の文字起こしに出てこない訂正を落とす。
+
+    ★2026-08-21 実測: 対応表の29組すべてが訂正一覧に載ったが、うち5組
+      （原稿法 / 欠陥自由 / 新衣工研 / 大理研扶養 / 私護事務）は
+      ★文字起こしに1回も出ていなかった。モデルが対応表を書き写しただけ。
+      直していないものを訂正として数えると、件数が嘘になる
+      （「特定補助 → 特定補助」を落としたのと同じ形）。
+
+    返す: (残した行, ★落とした行)。落とした分は呼び出し側が画面に出す。
+    """
+    keep, dropped = [], []
+    src = source or ""
+    for r in rows:
+        left = r.split("→")[0]
+        left = re.sub(r"（.*?）|\(.*?\)", "", left).strip()
+        if left and left in src:
+            keep.append(r)
+        else:
+            dropped.append(r)
+    return keep, dropped

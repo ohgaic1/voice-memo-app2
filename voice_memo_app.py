@@ -1204,6 +1204,13 @@ def generate_report_full(transcript, file_labels, material_text, api_key,
                  % ", ".join("区画%d" % i for i in no_heading))
 
     terms = RB.merge_rows(parsed, "terms")
+    # ★「直す前」が元の文字起こしに無い訂正を落とす。対応表を書き写しただけの
+    #   行が混ざると、訂正の件数が嘘になる（2026-08-21 実測で5組あった）。
+    terms, dropped_terms = RB.filter_corrections_by_source(terms, transcript)
+    if dropped_terms:
+        st.warning("★実際には直していない訂正を %d件 落としました（元の文字起こしに"
+                   "その語が出てきません）: %s"
+                   % (len(dropped_terms), " / ".join(dropped_terms[:5])))
     numbers = RB.merge_rows(parsed, "numbers")
     laws = RB.merge_rows(parsed, "laws")
     titles = RB.chapter_titles(chapters)
