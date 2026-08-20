@@ -9,15 +9,60 @@ import subprocess
 from openai import OpenAI
 import requests
 
-# ★Notion の rich_text は1要素 2000字まで。切り捨てずに分割する仕組みは
-#   shared-lib/notion_rich_text に1つだけ置く。★ここで自前で書かない。2026-08-19。
-import sys as _sys_nrt
-from pathlib import Path as _Path_nrt
-for _sl_nrt in (_Path_nrt(r"C:\dev\shared-lib"),
-                _Path_nrt(r"C:\Users\ohgai\dev\shared-lib")):
-    if _sl_nrt.is_dir() and str(_sl_nrt) not in _sys_nrt.path:
-        _sys_nrt.path.insert(0, str(_sl_nrt))
-from notion_rich_text import text_to_rich_text as _rt_all  # noqa: E402
+# ═══════════════════════════════════════════
+# Notion の rich_text を★切り捨てずに分割する（★このファイルに同梱）
+# ═══════════════════════════════════════════
+#
+# ★2026-08-19 に shared-lib/notion_rich_text を読む形にしたが、
+#   ★このアプリだけは PC-B ではなく Streamlit Community Cloud で動いており、
+#   そこに shared-lib は★存在しない（Linux なので Windows のパスも無い）。
+#   2026-08-20 実測: クラウドを再現すると、この位置で
+#     ModuleNotFoundError: No module named 'notion_rich_text'
+#   となり★アプリが起動しなかった。PC-B ではテストが通るので気づけなかった。
+#
+# ★try/except で「読めたら共有・読めなければ同梱」にはしない。
+#   それだと PC-B とクラウドで★違う実装が走り、
+#   テストが確かめているものと本番で動くものが別になる（＝今回と同じ形）。
+#   ★どこで動いても同じものが走るよう、同梱を必ず使う。
+#
+# ★同じ処理が2か所（ここと shared-lib）にある。ずれたら気づく形にしてある:
+#   dev-tools/tests/test_voice_memo_bundled_split.py が毎日、
+#   ★両方を実際に呼んで同じ入力に同じ出力を返すことを突き合わせる。
+#   直すときは★両方直すこと。片方だけ直すとそのテストが落ちる。
+#
+# ★切り捨てには戻さないこと。旧実装は 1990字ごとに割って先頭10塊で打ち切り、
+#   呼び出し側も text[:2000] で先に切っていた（19,900字で黙って消えていた）。
+
+#: Notion の rich_text 1要素の上限（文字数）。
+NOTION_RICH_TEXT_MAX = 2000
+#: Notion の rich_text 配列の上限（要素数）。
+NOTION_RICH_TEXT_MAX_BLOCKS = 100
+
+
+class RichTextTooLong(ValueError):
+    """★分割しても Notion に入らない長さ。黙って切らずに失敗させる。"""
+
+
+def _rt_all(text, *, max_chars=None):
+    """★文字列を切らずに rich_text 配列にする（2000字ごとに分ける）。
+
+    ・中身は1文字も変えない。区切りも足さない。連結すれば元に戻る。
+    ・★`text[:2000]` の代わりにこれを呼ぶ。
+    ・入らない長さなら RichTextTooLong を投げる。★黙って切らない。
+
+    ★shared-lib/notion_rich_text.text_to_rich_text と同じ挙動にすること。
+    """
+    s = "" if text is None else str(text)
+    n = max_chars or NOTION_RICH_TEXT_MAX
+    if not s:
+        return [{"text": {"content": ""}}]
+    parts = [s[i:i + n] for i in range(0, len(s), n)]
+    if len(parts) > NOTION_RICH_TEXT_MAX_BLOCKS:
+        raise RichTextTooLong(
+            "rich_text が %d要素になり、上限 %d を超えます（%d字）。"
+            "★切り捨てずに、保存先の設計を見直してください。"
+            % (len(parts), NOTION_RICH_TEXT_MAX_BLOCKS, len(s)))
+    return [{"text": {"content": p}} for p in parts]
 
 try:
     from dotenv import load_dotenv
@@ -528,12 +573,16 @@ window.addEventListener('load', function() {{
 # Notion ブロックヘルパー
 # ═══════════════════════════════════════════
 def _rich_text(content: str) -> list:
-    """★分割は shared-lib/notion_rich_text に1つだけ置く（2026-08-19）。
+    """★分割は _rt_all（このファイルの冒頭に同梱）に1つだけ置く。
 
     旧実装は 1990字ごとに割ったうえで★先頭10塊で打ち切っていた（19,900字で
     黙って消える）。さらに呼び出し側が `text[:2000]` で先に切っていたため、
     ★2000字を超える段落は保存すらされていなかった。
-    共有の分割器は 2000字ごとに割り、入らない長さは例外で★はっきり失敗させる。
+    分割器は 2000字ごとに割り、入らない長さは例外で★はっきり失敗させる。
+
+    ★2026-08-20: 2026-08-19 は shared-lib を読む形にしていたが、
+      このアプリは Streamlit Community Cloud で動き、そこに shared-lib は
+      無いため★起動しなかった。冒頭に同梱した（理由は同所のコメント）。
     """
     return _rt_all(content)
 
