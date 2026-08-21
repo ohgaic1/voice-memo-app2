@@ -930,3 +930,56 @@ def title_from_report(report_text: str) -> tuple[str, list[str]]:
         return made[:200], miss
     miss.append("★講師も日時も主催も取れないため、題名を作れません")
     return "", miss
+
+
+# ── 添付資料の名前を、研修DBの「ファイル名」欄の形にする ────────────
+#
+#   ★2026-08-21 追加。それまでアプリは添付の名前を研修DBに渡していなかった。
+#     今日の資料2本（20260422　研修資料.pdf / 次第　20260422.pdf）は
+#     ★ファイル名欄も、ページ本文の「② 添付資料」も空のまま入った。
+#   ★欄には名前だけを入れる。実体も道筋も入れない
+#     （GDriveリンク欄に入れる URL は存在しない＝2026-08-21 実測）。
+#   ★形は既存6行に揃える（2026-08-21 実測）:
+#     - 複数は " / " で並べる … kindle_vol_01.pdf / kindle_vol_02.pdf / …
+#     - 但し書きは括弧      … （調停委員用資料）/（資料・録音なし・口頭）
+
+#: ★添付を「確かめた上で無い」と言い切るときの書き方。
+NO_ATTACHMENT = "（添付なし）"
+#: ★呼び出し側が渡してこなかったときの書き方。
+#  ★空欄にしない。空欄だと「添付が無かった」と見分けが付かず、
+#    渡し忘れに誰も気付けない（2026-08-21 に実際に起きた）。
+ATTACHMENT_UNKNOWN = "★添付は未確認（渡されていません）"
+
+
+def attachment_names(info: list | None) -> str:
+    """★研修DBの「ファイル名」欄に入れる文字列。
+
+    ★3つを区別する。空欄は返さない。
+      名前あり … "a.pdf / b.pdf"
+      空リスト … 確かめた上で添付が無い
+      None    … ★呼び出し側が渡していない（渡し忘れ）
+    """
+    if info is None:
+        return ATTACHMENT_UNKNOWN
+    names = [str(f.get("name", "")).strip() for f in info if f.get("name")]
+    if not names:
+        return NO_ATTACHMENT
+    return " / ".join(names)
+
+
+def attachment_lines(info: list | None) -> list[str]:
+    """★ページ本文「② 添付資料」に並べる行。名前と容量。
+
+    ★欄と同じ判定を使う（別々に書くと片方だけ直る）。
+    """
+    if info is None:
+        return [ATTACHMENT_UNKNOWN]
+    out = []
+    for f in info:
+        name = str(f.get("name", "")).strip()
+        if not name:
+            continue
+        size = f.get("size")
+        out.append("%s  (%s KB)" % (name, f"{int(size) // 1024:,}")
+                   if isinstance(size, (int, float)) else name)
+    return out or [NO_ATTACHMENT]

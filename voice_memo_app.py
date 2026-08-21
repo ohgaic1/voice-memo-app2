@@ -911,6 +911,14 @@ def save_to_notion_kenshu(
     _summary = (("／".join(_head) + "\n" + (summary or "")) if _head
                 else (summary or ""))
     properties["概要"] = {"rich_text": [{"text": {"content": _summary[:500]}}]}
+
+    # ★添付資料の名前を「ファイル名」欄に入れる（2026-08-21 追加）。
+    #   ★名前だけ。実体も道筋も入れない。GDriveリンク欄は触らない
+    #     （入れる URL が存在しないため。2026-08-21 実測で 9/10行が空）。
+    #   ★渡されなかったときは空欄にせず「★添付は未確認」と書く。
+    #     空欄だと「添付が無かった」と見分けが付かない。
+    properties["ファイル名"] = {"rich_text": [{"text": {
+        "content": RB.attachment_names(attachment_file_info)[:2000]}}]}
     if tags:
         properties["タグ"] = {"multi_select": [{"name": t[:100]} for t in tags[:5]]}
 
@@ -945,12 +953,9 @@ def save_to_notion_kenshu(
 
         # ② 添付資料
         att_blocks = [_divider_block(), _heading_block(2, "② 添付資料")]
-        if attachment_file_info:
-            for fi in attachment_file_info:
-                size_kb = fi.get("size", 0) // 1024
-                att_blocks.append(_bulleted_block(f"{fi['name']}  ({size_kb} KB)"))
-        else:
-            att_blocks.append(_paragraph_block("（なし）"))
+        # ★欄と同じ判定を使う（別々に書くと片方だけ直る）。
+        for _line in RB.attachment_lines(attachment_file_info):
+            att_blocks.append(_bulleted_block(_line))
         _append_blocks(page_id, att_blocks, headers)
 
         # ③ 文字起こし（トグルブロック）
@@ -1770,6 +1775,30 @@ with st.expander("📂 既にあるファイルを研修DBに入れる（作り�
     _mm = _pick("マインドマップ", ["*.md"], "pick_mm")
     _sm = _pick("要約", ["*.html", "*.json"], "pick_sm")
 
+    # ★添付資料（配付資料など）の名前を渡す（2026-08-21 追加）。
+    #   ★実体は上げない。名前と容量だけを研修DBに渡す。
+    #   ★「選ばなかった」と「選ぶ機会が無かった」を混ぜないため、
+    #     ここで必ず一覧を出す（0件でも出す）。
+    _att_dir = st.text_input(
+        "添付資料のある場所（配付資料など・任意）", value=_base,
+        key="att_dir",
+        help="★名前と容量だけを研修DBに渡します。ファイルは上げません")
+    try:
+        _att_all = sorted([p for p in Path(_att_dir).rglob("*") if p.is_file()],
+                          key=lambda p: p.stat().st_mtime, reverse=True)[:80]
+    except Exception:                                        # noqa: BLE001
+        _att_all = []
+    _att_sel = st.multiselect(
+        "添付資料（複数可・選ばなければ「添付なし」として入ります）",
+        [p.name for p in _att_all], key="pick_att")
+    _by_name = {p.name: p for p in _att_all}
+    # ★空リスト（選ばなかった＝添付なし）と None（渡していない）を分ける。
+    #   ここは必ずリストを作る。None は渡さない。
+    _att_info = [{"name": n, "size": _by_name[n].stat().st_size}
+                 for n in _att_sel if n in _by_name]
+    st.caption("★研修DBの「ファイル名」欄に入る文字列: %s"
+               % RB.attachment_names(_att_info))
+
     if _rep:
         _bundle = RB.load_report_bundle(_rep, _tr, _mm, _sm)
         _ready = RB.bundle_readiness(_bundle)
@@ -1813,7 +1842,7 @@ with st.expander("📂 既にあるファイルを研修DBに入れる（作り�
                     markmap_md=_bundle["markmap_md"],
                     summary_data=_bundle["summary_data"],
                     source_info=_bundle["source_info"],
-                    attachment_file_info=None,
+                    attachment_file_info=_att_info,
                     about=_bundle["about"],
                 )
             if not _saved:
@@ -2260,7 +2289,10 @@ if st.session_state.results:
                                 markmap_md=result.get("markmap_md", ""),
                                 summary_data=result.get("summary_data"),
                                 source_info=src_info,
-                                attachment_file_info=result.get("attachment_file_info", []),
+                                # ★既定を [] にしない。キーが無いのは
+                                #   「渡していない」であって「添付なし」ではない。
+                                attachment_file_info=result.get(
+                                    "attachment_file_info"),
                                 about=_about,
                             )
                     if not NOTION_API_KEY:
