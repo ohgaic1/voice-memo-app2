@@ -764,6 +764,95 @@ def _append_blocks(page_id: str, blocks: list, headers: dict) -> None:
 # ═══════════════════════════════════════════
 # Notion 研修DB への保存
 # ═══════════════════════════════════════════
+def find_existing_kenshu(title: str) -> list[dict]:
+    """★同じ題名の行が研修DBに既にあるかを見る（読むだけ）。
+
+    ★2026-08-21 追加。二度入れると、同じ記録が2行になり、
+      どちらが最新か分からなくなる。★入れる前に見せる。
+    ★返すのは見つかった行。★「入れるな」とは決めない（決めるのは人）。
+    """
+    if not NOTION_API_KEY or not title:
+        return []
+    try:
+        r = requests.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_KENSHU}/query",
+            headers={"Authorization": f"Bearer {NOTION_API_KEY}",
+                     "Notion-Version": "2022-06-28",
+                     "Content-Type": "application/json"},
+            json={"filter": {"property": "タイトル",
+                             "title": {"equals": title[:200]}},
+                  "page_size": 10},
+            timeout=30)
+        r.raise_for_status()
+        out = []
+        for p in r.json().get("results", []):
+            pr = p["properties"]
+            out.append({
+                "page_id": p["id"],
+                "url": p.get("url", ""),
+                "検証状況": ((pr.get("検証状況") or {}).get("select") or {}).get("name", ""),
+                "作成日": ((pr.get("作成日") or {}).get("date") or {}).get("start", ""),
+            })
+        return out
+    except Exception as e:                                   # noqa: BLE001
+        # ★見に行けなかったことを「無かった」と混ぜない。
+        st.warning(f"⚠️ 同じ記録があるかを見に行けませんでした: {e}")
+        return [{"page_id": "", "url": "", "検証状況": "★確かめられません",
+                 "作成日": ""}]
+
+
+def verify_saved_kenshu(page_id: str, expect: dict) -> dict:
+    """★入れたあと、Notion から★読み直して中身が欠けていないかを見る。
+
+    ★これは受け側検証（正本: 共有CLAUDE.md「★検査・テスト・監視を作るとき」）。
+    突き合わせ元: 送ったときの戻り値（成功したという申告）
+    突き合わせ先: ★Notion から読み直したページの中身
+    ★送った側の戻り値だけを根拠にしない。
+    """
+    out = {"読めたか": False, "題名": "", "本文の字数": 0, "★欠け": []}
+    try:
+        h = {"Authorization": f"Bearer {NOTION_API_KEY}",
+             "Notion-Version": "2022-06-28"}
+        r = requests.get(f"https://api.notion.com/v1/pages/{page_id}",
+                         headers=h, timeout=30)
+        r.raise_for_status()
+        pr = r.json()["properties"]
+        out["読めたか"] = True
+        out["題名"] = "".join(x.get("plain_text", "")
+                            for x in (pr.get("タイトル") or {}).get("title", []))
+        # 本文（ブロック）を読み直して字数を数える
+        text, cur = "", None
+        while True:
+            q = {"page_size": 100}
+            if cur:
+                q["start_cursor"] = cur
+            b = requests.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children",
+                headers=h, params=q, timeout=30)
+            b.raise_for_status()
+            d = b.json()
+            for blk in d.get("results", []):
+                v = blk.get(blk.get("type"), {})
+                for rt in (v.get("rich_text") or []):
+                    text += rt.get("plain_text", "")
+            if not d.get("has_more"):
+                break
+            cur = d["next_cursor"]
+        out["本文の字数"] = len(text)
+        if out["題名"] != expect.get("title", ""):
+            out["★欠け"].append("題名が違います（送った: %s / 入った: %s）"
+                               % (expect.get("title", "")[:30], out["題名"][:30]))
+        # ★本文が極端に短ければ、入っていない疑い
+        if expect.get("report") and out["本文の字数"] < len(expect["report"]) * 0.3:
+            out["★欠け"].append(
+                "本文が短すぎます（送った %s字 → 入った %s字）"
+                % (f"{len(expect['report']):,}", f"{out['本文の字数']:,}"))
+    except Exception as e:                                   # noqa: BLE001
+        out["★欠け"].append("★読み直せませんでした: %s: %s"
+                          % (type(e).__name__, str(e)[:150]))
+    return out
+
+
 def save_to_notion_kenshu(
     title: str,
     tags: list,
@@ -856,15 +945,23 @@ def save_to_notion_kenshu(
                     toggle_id = b["id"]
                     break
             if toggle_id:
-                tr_chunks = [transcript[i:i+1990] for i in range(0, min(len(transcript), 60000), 1990)]
-                tr_blocks = [_paragraph_block(c) for c in tr_chunks[:90]]
+                # ★2026-08-21: 60000字と90ブロックの二重の打ち切りをやめた。
+                #   文字起こしは★あとで引き直すときの一次資料なので切らない。
+                tr_chunks = [transcript[i:i + 1990]
+                             for i in range(0, len(transcript), 1990)]
+                tr_blocks = [_paragraph_block(c) for c in tr_chunks]
                 _append_blocks(toggle_id, tr_blocks, headers)
 
         # ④ PLAUDレポート
         report_header = [_divider_block(), _heading_block(2, "④ PLAUDレポート")]
         _append_blocks(page_id, report_header, headers)
         report_blocks = markdown_to_notion_blocks(report)
-        _append_blocks(page_id, report_blocks[:200], headers)
+        # ★2026-08-21: [:200] で打ち切っていたのをやめた。
+        #   実測: 組み直したレポートは709ブロックあり、200で切ると
+        #   ★509ブロック・12,886字（本文の70%）が★黙って捨てられていた。
+        #   _append_blocks は90個ずつに分けて何度でも送るので、上限は要らない。
+        #   ★読み直しの検査（verify_saved_kenshu）がこれを捕まえた。
+        _append_blocks(page_id, report_blocks, headers)
 
         # ⑤ マインドマップ
         if markmap_md:
@@ -1609,6 +1706,110 @@ if not st.session_state.api_key:
     st.stop()
 
 # ── 入力ソース選択 ──
+# ═══════════════════════════════════════════
+# ★既にあるファイルを研修DBに入れる（2026-08-21 追加）
+# ═══════════════════════════════════════════
+#
+# ★それまで研修DBへ入れる口は「アプリでその場で作った結果」にしか無く、
+#   アプリを閉じると消えた（st.session_state に載っているだけ）。
+#   手元に .md があっても入れられなかった。
+# ★足りないのは入口だけ。保存の中身（save_to_notion_kenshu）は既にあるので
+#   ★同じ関数を呼ぶ。作り直さない。
+# ★新しい画面は作らない。この画面の中に畳んで置く。
+
+with st.expander("📂 既にあるファイルを研修DBに入れる（作り直しません）"):
+    st.caption(
+        "手元にあるレポート（.md）を選ぶと、研修DBに1行つくります。"
+        "★音声認識もレポート作成もやり直しません（費用はかかりません）。")
+
+    _base = st.text_input(
+        "ファイルのある場所",
+        value=str(Path.home() / "Downloads"),
+        help="ここに入っている .md / .txt / .html から選びます")
+
+    def _pick(label, pats, key):
+        try:
+            files = sorted(
+                [p for pat in pats for p in Path(_base).glob(pat)],
+                key=lambda p: p.stat().st_mtime, reverse=True)[:40]
+        except Exception:                                    # noqa: BLE001
+            files = []
+        names = ["（選ばない）"] + [p.name for p in files]
+        sel = st.selectbox(label, names, key=key)
+        return "" if sel == "（選ばない）" else str(Path(_base) / sel)
+
+    _rep = _pick("レポート（必須）", ["*.md"], "pick_report")
+    _tr = _pick("文字起こし", ["*.txt"], "pick_tr")
+    _mm = _pick("マインドマップ", ["*.md"], "pick_mm")
+    _sm = _pick("要約", ["*.html", "*.json"], "pick_sm")
+
+    if _rep:
+        _bundle = RB.load_report_bundle(_rep, _tr, _mm, _sm)
+        _ready = RB.bundle_readiness(_bundle)
+
+        # ★押す前に、何が足りないかを出す（黙って空で保存しない）
+        st.markdown("**入れる前の中身**")
+        st.table({"項目": [k for k in _ready if k != "★足りないもの"],
+                  "状態": [str(_ready[k]) for k in _ready if k != "★足りないもの"]})
+        if _ready["★足りないもの"]:
+            st.warning("★足りないもの:\n" +
+                       "\n".join("- " + m for m in _ready["★足りないもの"]))
+            st.caption("★足りなくても入れられます。入れるかどうかは大賀さんが決めてください。")
+
+        # ★同じ記録が既にあるかを見せる（二度入れないため）
+        _dups = find_existing_kenshu(_bundle["title"]) if NOTION_API_KEY else []
+        if _dups:
+            st.error("★同じ題名の記録が %d件 すでにあります。"
+                     "二度入れると、どちらが最新か分からなくなります。" % len(_dups))
+            for _d in _dups:
+                st.caption("  - 検証状況=%s / 作成日=%s / %s"
+                           % (_d["検証状況"], _d["作成日"], _d["url"]))
+
+        _c1, _c2 = st.columns([1, 1])
+        with _c1:
+            _ok = st.checkbox("★同じ記録があっても入れる", value=False,
+                              key="dup_ok", disabled=not _dups)
+        with _c2:
+            _go = st.button("☁️ このファイルを研修DBに入れる",
+                            disabled=(not NOTION_API_KEY) or bool(_dups and not _ok),
+                            key="save_from_file")
+
+        if _go:
+            with st.spinner("研修DBに入れています..."):
+                _saved = save_to_notion_kenshu(
+                    title=_bundle["title"],
+                    tags=extract_tags_from_report(_bundle["report"]),
+                    source_type="ファイルから",
+                    report=_bundle["report"],
+                    summary=_bundle["summary"],
+                    transcript=_bundle["transcript"],
+                    markmap_md=_bundle["markmap_md"],
+                    summary_data=_bundle["summary_data"],
+                    source_info=_bundle["source_info"],
+                    attachment_file_info=None,
+                )
+            if not _saved:
+                st.error("★入れられませんでした。上のエラーを見てください。")
+            else:
+                # ★送った側の戻り値だけを根拠にしない。読み直して確かめる。
+                _again = find_existing_kenshu(_bundle["title"])
+                if not _again or not _again[0].get("page_id"):
+                    st.error("★入ったかどうかを確かめられませんでした。"
+                             "Notion を開いて確かめてください。")
+                else:
+                    _v = verify_saved_kenshu(_again[0]["page_id"], _bundle)
+                    if _v["★欠け"]:
+                        st.error("★入りましたが、中身が欠けています:\n" +
+                                 "\n".join("- " + m for m in _v["★欠け"]))
+                    else:
+                        st.success(
+                            "✅ 研修DBに入り、読み直して確かめました"
+                            "（題名『%s』／本文 %s字）。"
+                            % (_v["題名"][:40], f"{_v['本文の字数']:,}"))
+                    st.caption("★「投入可」のチェックは付いていません。"
+                               "Dify に入れるかは、Notion で見て決めてください。")
+
+st.markdown("---")
 st.subheader("① 入力ソースを選択")
 source_type = st.radio(
     "入力ソース",

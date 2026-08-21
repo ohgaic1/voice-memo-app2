@@ -716,3 +716,105 @@ def filter_corrections_by_source(rows: list[str], source: str) -> tuple[list, li
         else:
             dropped.append(r)
     return keep, dropped
+
+
+# ── 既にあるファイルから、研修DBへ入れる材料を作る ────────────────
+#
+#   ★2026-08-21 追加。それまで研修DBへ入れる口は
+#     「アプリでその場で作った結果」にしか無く、
+#     ★アプリを閉じると消えた（st.session_state に載っているだけ）。
+#     手元に .md があっても入れられなかった。
+#   ★足りないのは入口だけ。保存の中身（save_to_notion_kenshu）は既にある。
+#     ここは★ファイルを読んで渡す材料を作るだけ。保存はしない。
+
+#: ★足りなくても入れてよい。ただし★黙って空で保存しない（呼び出し側が出す）。
+OPTIONAL_PARTS = ("transcript", "markmap_md", "summary_data")
+
+
+def load_report_bundle(report_path, transcript_path="", markmap_path="",
+                       summary_path="") -> dict:
+    """★手元のファイルを読んで、研修DBへ渡す材料にする。
+
+    ★無いものは無いまま返す（勝手に作らない）。
+    ★読めなかったことを「空」と混ぜない。missing に理由つきで残す。
+    返す: {title, report, summary, transcript, markmap_md, summary_data,
+           missing:[...], source_info:[...]}
+    """
+    out = {"title": "", "report": "", "summary": "", "transcript": "",
+           "markmap_md": "", "summary_data": None,
+           "missing": [], "source_info": []}
+
+    p = Path(report_path)
+    try:
+        out["report"] = p.read_text(encoding="utf-8")
+        out["source_info"].append(p.name)
+    except Exception as e:                                   # noqa: BLE001
+        out["missing"].append("★レポート本体を読めません（%s）: %s"
+                              % (p.name, type(e).__name__))
+        return out
+
+    for key, path, label in (("transcript", transcript_path, "文字起こし"),
+                             ("markmap_md", markmap_path, "マインドマップ")):
+        if not path:
+            out["missing"].append("%sのファイルが選ばれていません" % label)
+            continue
+        try:
+            out[key] = Path(path).read_text(encoding="utf-8")
+            out["source_info"].append(Path(path).name)
+        except Exception as e:                               # noqa: BLE001
+            out["missing"].append("★%sを読めません（%s）: %s"
+                                  % (label, Path(path).name, type(e).__name__))
+
+    if summary_path:
+        try:
+            raw = Path(summary_path).read_text(encoding="utf-8")
+            out["source_info"].append(Path(summary_path).name)
+            if summary_path.lower().endswith(".json"):
+                out["summary_data"] = json.loads(raw)
+            else:
+                # ★HTML はそのままでは構造化サマリーにならない。
+                #   ★中身を作り直さない。無いものは無いままにする。
+                out["missing"].append(
+                    "要約は HTML なので、構造化サマリーとしては渡せません"
+                    "（レポート本体には影響しません）")
+        except Exception as e:                               # noqa: BLE001
+            out["missing"].append("★要約を読めません（%s）: %s"
+                                  % (Path(summary_path).name, type(e).__name__))
+    else:
+        out["missing"].append("要約のファイルが選ばれていません")
+
+    # ★題名と概要は、レポート本体から取る（既にある取り出し方に合わせる）
+    m = re.search(r"^#\s+(.+)$", out["report"], re.M)
+    out["title"] = (m.group(1).strip() if m else "")[:200]
+    if not out["title"]:
+        out["missing"].append("★レポートの1行目に題名（# …）がありません")
+    out["summary"] = "\n".join(out["report"].splitlines()[:10])
+    return out
+
+
+def bundle_readiness(bundle: dict) -> dict:
+    """★入れる前に「何が足りないか」を出す。★足りなくても入れてよい。
+
+    ★ここで良し悪しを決めない。決めるのは人。
+    """
+    rep = bundle.get("report") or ""
+    # ★判定は shared-lib/gate_checks に1か所だけ置く。ここに写さない。
+    try:
+        import gate_checks as _G                             # noqa: PLC0415
+        cov = _G.coverage_of(rep)
+        marks = _G.mark_progress(rep)["total"]
+    except Exception:                                        # noqa: BLE001
+        cov, marks = None, None
+    return {
+        "レポート本体": "あり（%s字）" % f"{len(rep):,}" if rep else "★無し",
+        "題名": bundle.get("title") or "★取れませんでした",
+        "文字起こし": ("あり（%s字）" % f"{len(bundle['transcript']):,}"
+                     if bundle.get("transcript") else "★無し"),
+        "マインドマップ": "あり" if bundle.get("markmap_md") else "★無し",
+        "構造化サマリー": "あり" if bundle.get("summary_data") else "★無し",
+        "読んだ量の記載": ("%.1f%%" % (cov["ratio"] * 100) if cov
+                       else "★書かれていません"),
+        "公表状態の節": ("あり" if "★公的な裏付けが無い箇所" in rep else "★無し"),
+        "要突合の印": marks if marks is not None else "★数えられません",
+        "★足りないもの": bundle.get("missing") or [],
+    }
