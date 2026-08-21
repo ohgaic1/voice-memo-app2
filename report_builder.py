@@ -34,6 +34,8 @@ for _sl in (Path(__file__).resolve().parent.parent / "shared-lib",
         break
 
 import api_prices                                            # noqa: E402
+#: ★和暦の漢数字を読むのに使う。関所の判定と同じ実装を使う（二重に持たない）。
+from gate_checks import kanji_to_int                          # noqa: E402
 
 #: 1区画の本文の長さ。今日の実測（53,171字 / 128.2分 ≒ 415字/分）で
 #  おおよそ10分ぶんにあたる。★短くすると区画が増え、指示文の再送で費用が伸びる。
@@ -783,11 +785,14 @@ def load_report_bundle(report_path, transcript_path="", markmap_path="",
     else:
         out["missing"].append("要約のファイルが選ばれていません")
 
-    # ★題名と概要は、レポート本体から取る（既にある取り出し方に合わせる）
-    m = re.search(r"^#\s+(.+)$", out["report"], re.M)
-    out["title"] = (m.group(1).strip() if m else "")[:200]
-    if not out["title"]:
-        out["missing"].append("★レポートの1行目に題名（# …）がありません")
+    # ★題名は「この記録について」の題名から取る（2026-08-21 変更）。
+    #   ★それまで1行目の見出し（# 講演の記録）を拾っていたが、
+    #     どのレポートも同じ見出しなので★研修DBで講演を見分けられなかった。
+    #   ★取れなくても見出しには戻さない（title_from_report の中に理由あり）。
+    out["title"], _t_miss = title_from_report(out["report"])
+    out["missing"].extend(_t_miss)
+    out["about"] = parse_about(out["report"])
+    out["event_date"] = parse_event_date(out["about"].get("日時", ""))
     out["summary"] = "\n".join(out["report"].splitlines()[:10])
     return out
 
@@ -818,3 +823,104 @@ def bundle_readiness(bundle: dict) -> dict:
         "要突合の印": marks if marks is not None else "★数えられません",
         "★足りないもの": bundle.get("missing") or [],
     }
+
+
+# ── 「この記録について」から題名などを取り出す ──────────────────
+#
+#   ★2026-08-21 追加。それまで題名はレポートの1行目の見出し（# 講演の記録）を
+#     拾っていた。全部のレポートが同じ見出しなので、★研修DBの題名が
+#     どれも「講演の記録」になり、講演を見分けられなかった。
+#   ★「この記録について」の節には 題名 / 日時 / 講師 / 主催 が書かれている。
+#     ここから取る。★取れないときに見出しへ戻さない（また同じことが起きる）。
+
+ABOUT_SECTION = "この記録について"
+#: ★取り出す項目。研修DBの欄に入れられるかは呼び出し側が決める。
+ABOUT_KEYS = ("題名", "日時", "講師", "主催", "配付資料")
+#: ★モデルが「分からない」と書いたときの言い方。値として扱わない。
+_UNKNOWN_WORDS = ("不明", "未確認", "記載なし", "（不明）", "-", "—")
+
+_ABOUT_ROW = re.compile(r"^[-*・]\s*(題名|日時|講師|主催|配付資料)\s*[:：]\s*(.+?)\s*$", re.M)
+
+
+def parse_about(report_text: str) -> dict:
+    """★「この記録について」から項目を取り出す。
+
+    ★「不明」と書かれていたら、値としては空にする（不明という文字を
+      題名にしない）。取れなかったことは呼び出し側が扱う。
+    """
+    t = report_text or ""
+    i = t.find(ABOUT_SECTION)
+    if i < 0:
+        return {}
+    sec = t[i:]
+    j = sec.find("\n## ", 3)
+    if j > 0:
+        sec = sec[:j]
+    out = {}
+    for m in _ABOUT_ROW.finditer(sec):
+        k, v = m.group(1), m.group(2).strip()
+        if v in _UNKNOWN_WORDS or not v:
+            continue
+        out[k] = v
+    return out
+
+
+#: ★和暦を西暦に直すための、元年の年（令和1年 = 2019年）。
+_ERA = {"令和": 2018, "平成": 1988, "昭和": 1925}
+_DATE = re.compile(r"(令和|平成|昭和)\s*([0-9０-９一二三四五六七八九十元]+)\s*年"
+                   r"\s*([0-9０-９一二三四五六七八九十]+)\s*月"
+                   r"\s*([0-9０-９一二三四五六七八九十]+)\s*日")
+
+
+def parse_event_date(text: str) -> str | None:
+    """★「令和8年4月22日」→ "2026-04-22"。読めなければ None（推測しない）。"""
+    t = (text or "").translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    m = _DATE.search(t)
+    if not m:
+        m2 = re.search(r"(20\d{2})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", t)
+        if not m2:
+            return None
+        y, mo, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+        return "%04d-%02d-%02d" % (y, mo, d)
+    def num(s):
+        return 1 if s == "元" else (int(s) if s.isdigit() else kanji_to_int(s))
+    y = num(m.group(2))
+    mo, d = num(m.group(3)), num(m.group(4))
+    if None in (y, mo, d):
+        return None
+    return "%04d-%02d-%02d" % (_ERA[m.group(1)] + y, mo, d)
+
+
+def title_from_report(report_text: str) -> tuple[str, list[str]]:
+    """★研修DBに入れる題名を決める。返す: (題名, ★足りないもの)。
+
+    順番:
+      1. 「この記録について」の題名 … ★これが本命
+      2. 講師名と日付から組み立てる … 題名が無いとき
+      3. ★見出し（# 講演の記録）には戻さない
+         理由: 全レポートが同じ見出しなので、題名にすると見分けられなくなる。
+         2026-08-21 に実際に「講演の記録」で1行入り、次を入れると
+         ★重複として止まる形になった。
+    """
+    about = parse_about(report_text)
+    miss = []
+    t = about.get("題名", "").strip()
+    if t:
+        return t[:200], miss
+
+    miss.append("★レポートの「この記録について」に題名が書かれていません")
+    # ★組み立てる。何から作ったかが分かる形にする。
+    parts = []
+    d = parse_event_date(about.get("日時", ""))
+    if d:
+        parts.append(d)
+    if about.get("講師"):
+        parts.append(about["講師"].split("（")[0].strip())
+    if about.get("主催"):
+        parts.append(about["主催"])
+    if parts:
+        made = "（題名なし）" + " ".join(parts)
+        miss.append("題名の代わりに「%s」を使います" % made[:60])
+        return made[:200], miss
+    miss.append("★講師も日時も主催も取れないため、題名を作れません")
+    return "", miss

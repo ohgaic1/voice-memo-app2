@@ -594,11 +594,16 @@ def get_youtube_transcript(url: str) -> tuple:
 # レポートからタイトル・タグを抽出
 # ═══════════════════════════════════════════
 def extract_title_from_report(report: str) -> str:
-    for line in report.splitlines():
-        line = line.strip()
-        if line.startswith("# ") and not line.startswith("## "):
-            return line[2:].strip()
-    return "音声メモレポート"
+    """★研修DBに入れる題名。中身は report_builder に1つだけ置く。
+
+    ★2026-08-21 変更。それまでは1行目の見出し（`# …`）を返していた。
+      レポートの見出しは★どれも「講演の記録」なので、研修DBの題名が
+      全部同じになり、講演を見分けられなくなっていた（実際に1行入った）。
+    ★見出しへは戻さない。取れないときは空を返し、呼び出し側が
+      「題名が無い」と分かる形にする。黙って既定の名前で埋めない。
+    """
+    title, _ = RB.title_from_report(report)
+    return title
 
 
 def extract_tags_from_report(report: str) -> list[str]:
@@ -864,6 +869,7 @@ def save_to_notion_kenshu(
     summary_data: dict = None,
     source_info: list = None,
     attachment_file_info: list = None,
+    about: dict = None,
 ) -> bool:
     if not NOTION_API_KEY:
         st.error("⚠️ NOTION_TOKEN が未設定です。OneDrive の secrets フォルダにある .env を確認してください。")
@@ -876,14 +882,35 @@ def save_to_notion_kenshu(
     }
     date_iso = datetime.now().strftime("%Y-%m-%d")
 
+    # ★「この記録について」から取れたもの（2026-08-21 追加）。
+    #   ★研修DBの欄は12個あり、新しくは作らない。入れられる先だけに入れる。
+    #     日時 → 実施日 ／ 講師・主催 → 概要の冒頭 ／ 題名 → タイトル
+    #   ★入れられない欄が無いものは「渡せません」として画面に出す。
+    about = about or {}
+
     properties: dict = {
         "タイトル": {"title": [{"text": {"content": title[:200]}}]},
         "ジャンル": {"select": {"name": "その他"}},
         "種別":   {"select": {"name": source_type}},
-        "実施日": {"date": {"start": date_iso}},
         "作成日": {"date": {"start": date_iso}},
-        "概要":   {"rich_text": [{"text": {"content": summary[:500]}}]},
     }
+
+    # ★実施日は「講演が行われた日」。作った日ではない。
+    #   ★読めないときは★入れない。今日の日付で埋めると、講演日として
+    #     間違ったものが残り、あとから見分けられなくなる（空＝未確認）。
+    _event = RB.parse_event_date(about.get("日時", ""))
+    if _event:
+        properties["実施日"] = {"date": {"start": _event}}
+
+    # ★講師・主催に対応する欄は研修DBに無い。新しく作らず、概要の冒頭に置く。
+    #   ★概要そのものは消さない（前に付けるだけ）。
+    _head = []
+    for _k in ("講師", "主催"):
+        if about.get(_k):
+            _head.append("%s: %s" % (_k, about[_k]))
+    _summary = (("／".join(_head) + "\n" + (summary or "")) if _head
+                else (summary or ""))
+    properties["概要"] = {"rich_text": [{"text": {"content": _summary[:500]}}]}
     if tags:
         properties["タグ"] = {"multi_select": [{"name": t[:100]} for t in tags[:5]]}
 
@@ -1787,6 +1814,7 @@ with st.expander("📂 既にあるファイルを研修DBに入れる（作り�
                     summary_data=_bundle["summary_data"],
                     source_info=_bundle["source_info"],
                     attachment_file_info=None,
+                    about=_bundle["about"],
                 )
             if not _saved:
                 st.error("★入れられませんでした。上のエラーを見てください。")
@@ -2205,6 +2233,17 @@ if st.session_state.results:
                         if st.button("☁️ Notionに保存", key=f"notion_{result['date']}",
                                      disabled=not NOTION_API_KEY):
                             title = extract_title_from_report(result["report"])
+                            _about = RB.parse_about(result["report"])
+                            if not title:
+                                # ★題名が無いまま黙って既定名で埋めない。
+                                #   ★同じ名前が並ぶと重複の判定が効かなくなるので、
+                                #     作った時刻を付けて見分けが付く形にする。
+                                title = "（題名なし）" + datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M")
+                                st.warning(
+                                    "★レポートの「この記録について」に題名が"
+                                    "ありません。研修DBには『%s』で入れます。"
+                                    "Notion で直してください。" % title)
                             tags  = extract_tags_from_report(result["report"])
                             summary_text = "\n".join(result["report"].splitlines()[:10])
                             # source_info: ファイル名またはURL一覧
@@ -2222,6 +2261,7 @@ if st.session_state.results:
                                 summary_data=result.get("summary_data"),
                                 source_info=src_info,
                                 attachment_file_info=result.get("attachment_file_info", []),
+                                about=_about,
                             )
                     if not NOTION_API_KEY:
                         st.caption("⚠️ NOTION_API_KEY 未設定のため保存不可")

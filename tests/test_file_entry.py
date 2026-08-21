@@ -76,7 +76,12 @@ def _write(tmp, name, text):
     return str(p)
 
 
-REPORT = """# テスト講演の記録
+REPORT = """# 講演の記録
+
+## 1. この記録について
+
+- 題名: テスト講演の記録
+- 講師: テスト講師
 
 ## 3. 本編
 ### 【章】本文
@@ -102,6 +107,8 @@ def test_ファイルから読んだ内容が欠けずに渡る(tmp_path):
     assert b["report"] == REPORT, "★レポートが欠けています"
     assert b["transcript"] == "[00:00:00] 文字起こしの中身"
     assert b["markmap_md"] == "# マップ\n## 章"
+    # ★題名は見出し（講演の記録）ではなく「この記録について」から取る
+    #   （2026-08-21 変更。詳細は tests/test_title_from_about.py）
     assert b["title"] == "テスト講演の記録", b["title"]
     assert b["summary"], "★概要が空です"
     assert "r.md" in b["source_info"] and "t.txt" in b["source_info"]
@@ -160,7 +167,7 @@ def test_読んだ量が無ければ無いと出る(tmp_path):
 
 
 def test_題名が取れなければ足りないに入る(tmp_path):
-    b = RB.load_report_bundle(_write(tmp_path, "r.md", "題名の # が無い本文"))
+    b = RB.load_report_bundle(_write(tmp_path, "r.md",  "# 講演の記録\n本文だけ"))
     assert b["title"] == ""
     assert any("題名" in m for m in b["missing"])
 
