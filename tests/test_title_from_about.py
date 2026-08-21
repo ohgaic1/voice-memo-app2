@@ -212,3 +212,32 @@ def test_両方の入口がaboutを渡す():
     assert len(calls) == 2
     for c in calls:
         assert "about" in {k.arg for k in c.keywords}, "★片方だけ直っています"
+
+
+# ── ⑥ ★破綻点の検知：実施日が入らないことを押す前に見せる ──────
+#
+#   ★実施日はページを作るときにしか入らない。日時が読めない行は
+#     空のまま残り、★空であることが誰の目にも触れない。
+#   2026-08-21 に実際に「入れた日」のまま1行残った（page 3c367ba3-…）。
+
+def test_実施日が押す前の表に出る(tmp_path):
+    p = tmp_path / "r.md"
+    p.write_text(FULL, encoding="utf-8")
+    r = RB.bundle_readiness(RB.load_report_bundle(str(p)))
+    assert r["実施日（講演の日）"] == "2026-04-22", r["実施日（講演の日）"]
+
+
+def test_日時が読めなければ読めないと出る(tmp_path):
+    p = tmp_path / "r.md"
+    p.write_text(FULL.replace("令和 8 年 4 月 22 日（水）17 時 30 分～19 時 30 分",
+                              "先日の夕方"), encoding="utf-8")
+    r = RB.bundle_readiness(RB.load_report_bundle(str(p)))
+    assert "★入りません" in r["実施日（講演の日）"], r["実施日（講演の日）"]
+
+
+def test_読めないのに空欄と混ぜない(tmp_path):
+    """★仕掛けの裏取り。日付を消したのに日付が出るなら効いていない。"""
+    p = tmp_path / "r.md"
+    p.write_text(BARE, encoding="utf-8")
+    r = RB.bundle_readiness(RB.load_report_bundle(str(p)))
+    assert r["実施日（講演の日）"].startswith("★"), r["実施日（講演の日）"]

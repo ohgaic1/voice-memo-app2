@@ -813,6 +813,12 @@ def bundle_readiness(bundle: dict) -> dict:
     return {
         "レポート本体": "あり（%s字）" % f"{len(rep):,}" if rep else "★無し",
         "題名": bundle.get("title") or "★取れませんでした",
+        # ★実施日は「講演が行われた日」。ページを作るときにしか入らないので、
+        #   ★入らないことを押す前に見せる（あとから空だと気付けない）。
+        #   2026-08-21: 実際に「入れた日」のまま1行残り、指摘されるまで
+        #   気付けなかった（page 3c367ba3-…）。
+        "実施日（講演の日）": (bundle.get("event_date")
+                        or "★入りません（日時が読めません）"),
         "文字起こし": ("あり（%s字）" % f"{len(bundle['transcript']):,}"
                      if bundle.get("transcript") else "★無し"),
         "マインドマップ": "あり" if bundle.get("markmap_md") else "★無し",
