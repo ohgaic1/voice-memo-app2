@@ -949,8 +949,9 @@ _CHUNK_TEMPLATE = """以下は、ある講演の文字起こしの★一部（�
 例示があればそのまま。無ければ「なし」。
 
 **言い切られていないこと**
-「〜と思われる」「今後の議論」など、講師が断定しなかった部分。
+「〜と思われる」「今後の議論」など、★講師がどれだけ確信しているか（確信度）。
 ★ここを落とさない。断定に変えない。
+★下の「公表状態」とは別物。確信して話しているが未公表、ということがある。
 
 ■ ★守ること
 
@@ -992,7 +993,26 @@ _CHUNK_TEMPLATE = """以下は、ある講演の文字起こしの★一部（�
 
 <<<条文・法令>>>
 法令名 | 条 | どういう文脈で出たか
-（この区間で挙がった法令名と条文番号を1行ずつ）"""
+（この区間で挙がった法令名と条文番号を1行ずつ）
+
+<<<公表状態>>>
+主題 | 講師の発言をそのまま引く | 時刻
+（★講師が「まだ公にしていない」と断った箇所を1行ずつ。無ければ「なし」）
+
+■ ★「公表状態」について（★これは確信度とは別物）
+
+★次のような箇所を拾う。講師が★確信して話していても、
+  それが★まだ公にされていないなら、ここに入れる:
+  ・「オフレコ」「ここだけの話」「フライング」
+  ・「まだどこにも言っていない」「まだ公表していない」「未公表」
+  ・「◯◯にもまだ伝えていない」「まだ発表されていない」
+  ・「これは私見ですが」「政府見解ではありませんが」
+  ・「後で立法担当解説に書かれる」「今後の国会審議で明らかにされる」
+    （＝★いま時点では公的な裏付けが無い、という意味）
+★上に挙げた言い方は例です。同じ趣旨の別の言い回しも拾ってください。
+★拾ったものを本文に溶かし込まないこと。ここに分けて出す。
+★これは「入れてはいけない」という意味ではありません。
+  入れるかどうかは人が決めるので、★判断の材料として残してください。"""
 
 _OVERVIEW_SYSTEM = (
     "あなたは記録係です。★章の見出しだけを見て、全体像を書きます。"
@@ -1213,6 +1233,12 @@ def generate_report_full(transcript, file_labels, material_text, api_key,
                    % (len(dropped_terms), " / ".join(dropped_terms[:5])))
     numbers = RB.merge_rows(parsed, "numbers")
     laws = RB.merge_rows(parsed, "laws")
+    # ★公表状態は本文に混ぜず、判断の対象として別の節に出す。
+    publicity = RB.merge_rows(parsed, "publicity")
+    if publicity:
+        st.warning("★公的な裏付けが無い箇所が %d件 あります。"
+                   "レポートの「★公的な裏付けが無い箇所」を見て、"
+                   "知識ベースに入れるかを決めてください。" % len(publicity))
     titles = RB.chapter_titles(chapters)
 
     # ★本文に数値が残っていないかを機械的に数える。指示だけでは守られない
@@ -1232,7 +1258,7 @@ def generate_report_full(transcript, file_labels, material_text, api_key,
                         + ([material_note] if material_note else []))
     return RB.assemble_full(about, overview, chapters, terms, numbers, laws,
                             cov, gaps, next_steps, note, no_heading,
-                            num_found), cov, est
+                            num_found, publicity), cov, est
 
 
 # ═══════════════════════════════════════════

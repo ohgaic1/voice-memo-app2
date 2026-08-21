@@ -341,7 +341,13 @@ def chapter_titles(chapters: list[str]) -> list[str]:
 MARK_TERMS = "<<<用語の訂正>>>"
 MARK_NUMS = "<<<日付・数値>>>"
 MARK_LAWS = "<<<条文・法令>>>"
-MARKS = (MARK_TERMS, MARK_NUMS, MARK_LAWS)
+#: ★公表状態。確信度（「言い切られていないこと」）とは別物。
+#  ★2026-08-21 実測: 文字起こしに「オフレコ」「フライング」「まだどこにも」が
+#    あるのに、レポート本文では全部0件だった。指示に項目が無かったため。
+#    該当箇所は区画1に入っており、その区画は読まれていた（13/13・100%）。
+#    ★読んだのに落ちる形だった。
+MARK_PUB = "<<<公表状態>>>"
+MARKS = (MARK_TERMS, MARK_NUMS, MARK_LAWS, MARK_PUB)
 
 
 #: ★指示文の見出しをそのまま書き写してくることがある（2026-08-20 実測）。
@@ -378,8 +384,10 @@ def parse_chunk_output(text: str) -> dict:
     pos = [(s.find(m), m) for m in MARKS if s.find(m) >= 0]
     pos.sort()
     chapters = s[:pos[0][0]].strip() if pos else s.strip()
-    out = {"chapters": chapters, "terms": [], "numbers": [], "laws": []}
-    key = {MARK_TERMS: "terms", MARK_NUMS: "numbers", MARK_LAWS: "laws"}
+    out = {"chapters": chapters, "terms": [], "numbers": [], "laws": [],
+           "publicity": []}
+    key = {MARK_TERMS: "terms", MARK_NUMS: "numbers", MARK_LAWS: "laws",
+           MARK_PUB: "publicity"}
     for i, (p, m) in enumerate(pos):
         end = pos[i + 1][0] if i + 1 < len(pos) else len(s)
         body = s[p + len(m):end]
@@ -451,12 +459,34 @@ def laws_section(rows: list[str]) -> str:
                      + ["| %s | ★要突合 |" % r for r in rows])
 
 
+def publicity_section(rows: list[str]) -> str:
+    """★公的な裏付けが無い箇所を、本文とは分けて出す節。
+
+    ★これは「入れてはいけない」という意味ではない。入れるかは人が決める。
+      ★勝手に本文へ混ぜない・勝手に捨てない、の両方を満たすための置き場。
+    ★0件のときに「無い」と言い切らない。拾えなかっただけかもしれない。
+    """
+    if not rows:
+        return ("## ★公的な裏付けが無い箇所\n\n"
+                "★拾えたのは0件です。\n"
+                "※ 0件は「無い」という意味ではありません。"
+                "講師が公表状態に触れなかったか、拾えなかったかのどちらかです。")
+    return "\n".join(
+        ["## ★公的な裏付けが無い箇所", "",
+         "★%d件。講師が「まだ公にしていない」と断った箇所です。" % len(rows),
+         "★入れてはいけないという意味ではありません。"
+         "知識ベースに入れるかどうかを、ここを見て決めてください。", "",
+         "| 主題・発言・時刻 |", "|---|"]
+        + ["| %s |" % r for r in rows])
+
+
 def assemble_full(about: str, overview: str, chapters: list[str],
                   terms: list[str], numbers: list[str], laws: list[str],
                   cov: dict, gaps: list[dict] | None,
                   next_steps: str = "", source_note: str = "",
                   no_heading: list[int] | None = None,
-                  num_found: dict | None = None) -> str:
+                  num_found: dict | None = None,
+                  publicity: list[str] | None = None) -> str:
     """★決められた順に組み立てる。本編は連結するだけ（要約しない）。"""
     parts = ["# 講演の記録", ""]
     parts += ["## 1. この記録について", "",
@@ -476,6 +506,8 @@ def assemble_full(about: str, overview: str, chapters: list[str],
     parts += [numbers_section(numbers), ""]
     parts += [laws_section(laws), ""]
     parts += [terms_section(terms), ""]
+    # ★本文には混ぜず、判断の対象として分けて出す。
+    parts += [publicity_section(publicity or []), ""]
     parts += [gaps_section(gaps or []), ""]
     if num_found is not None:
         parts += [numbers_check_section(num_found, chapters), ""]

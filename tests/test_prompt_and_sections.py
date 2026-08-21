@@ -279,3 +279,64 @@ def test_混ざり物を落とす仕掛けを外すと落ちる():
     assert RB._is_noop_correction("特定補助 → 特定補助")
     assert not RB._is_noop_correction("公権 → 後見")
     assert not RB._is_header_row("施行 | 令和9年4月 | 明確")
+
+
+# ── ⑦ ★公表状態（確信度とは別物）2026-08-21 ────────────────
+
+def test_公表状態を確信度と別に拾わせている():
+    """★実測 2026-08-21: 指示に公表状態の項目が無く、読んだのに落ちていた。
+
+    該当箇所（オフレコ・フライング・まだどこにも）は区画1にあり、
+    その区画は読まれていた（13/13・100%）。
+    """
+    assert RB.MARK_PUB in TPL, "★公表状態の枠を出させていない"
+    assert "確信度" in TPL, "★確信度と別物であることを書いていない"
+    i = TPL.index("**言い切られていないこと**")
+    blk = TPL[i:i + 260]
+    assert "別物" in blk, "★確信度の節に、別物である旨が書かれていない"
+
+
+def test_公表状態の例が指示に入っている():
+    for w in ("オフレコ", "ここだけの話", "まだ公表していない", "私見",
+              "政府見解ではありません"):
+        assert w in TPL, "★例が抜けています: %s" % w
+    assert "別の言い回しも拾って" in TPL, (
+        "★例だけを拾う形になっています（取りこぼします）")
+
+
+def test_拾ったものを本文に混ぜさせない():
+    assert "本文に溶かし込まない" in TPL, "★本文へ混ぜるなと言っていない"
+    assert "「入れてはいけない」という意味ではありません" in TPL, (
+        "★勝手に捨てられる恐れがあります")
+    assert "判断の材料として残して" in TPL, "★残せと言っていない"
+
+
+def test_公表状態を本文と別の節に出す():
+    cov = {"total_chars": 10, "read_chars": 10, "dropped_chars": 0,
+           "ratio": 1.0, "chunks": 1, "chunks_ok": 1, "missing": [],
+           "truncated": [], "complete": True}
+    md = RB.assemble_full("題名", "全体像", ["### 【章】本文"], [], [], [],
+                          cov, [], "", "", None, None,
+                          ["主題 | 「オフレコ」 | 00:14:57"])
+    assert "## ★公的な裏付けが無い箇所" in md
+    assert "00:14:57" in md
+    body = md.split("## 3. 本編")[1].split("## ")[0]
+    assert "オフレコ" not in body, "★本文に混ざっています"
+
+
+def test_0件を無いと言い切らない():
+    md = RB.publicity_section([])
+    assert "拾えたのは0件" in md
+    assert "「無い」という意味ではありません" in md
+
+
+def test_区画の出力から公表状態を読み取れる():
+    p = RB.parse_chunk_output(
+        "### 【章】本文\n\n<<<公表状態>>>\n"
+        "経過規定 | 「実は半分ぐらいオフレコで」 | 00:14:57\n")
+    assert p["publicity"] == ["経過規定 | 「実は半分ぐらいオフレコで」 | 00:14:57"]
+
+
+def test_公表状態の枠を外すと検査が落ちる():
+    broken = TPL.replace(RB.MARK_PUB, "")
+    assert RB.MARK_PUB not in broken, "★変異が効いていない"
