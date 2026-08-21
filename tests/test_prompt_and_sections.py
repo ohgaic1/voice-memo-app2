@@ -340,3 +340,60 @@ def test_区画の出力から公表状態を読み取れる():
 def test_公表状態の枠を外すと検査が落ちる():
     broken = TPL.replace(RB.MARK_PUB, "")
     assert RB.MARK_PUB not in broken, "★変異が効いていない"
+
+
+# ── ⑧ ★一覧に本文が流れ込まないこと（2026-08-21 実測）────────
+
+SPILL = """### 【章A】
+本文A
+
+<<<公表状態>>>
+主題 | 発言 | 00:14:57
+
+### 【章B】
+本文B
+
+**何が変わるのか／何が論点か**
+本文B の続き
+"""
+
+
+def test_印の後ろに来た章は本文へ返す():
+    """★実測 2026-08-21: 最後の区画が印の後ろに章を書き、
+    その5章ぶん62行が「公的な裏付けが無い箇所」の表に流れ込んだ。
+    件数が 4件 → ★66件 と表示され、★本編からは章が消えていた。
+    """
+    p = RB.parse_chunk_output(SPILL)
+    assert p["publicity"] == ["主題 | 発言 | 00:14:57"], p["publicity"]
+    assert "### 【章B】" in p["chapters"], "★章が本文に戻っていない"
+    assert "本文B の続き" in p["chapters"], "★章の中身が落ちている"
+
+
+def test_流れ込んだ行を捨てない():
+    """★勝手に消さない。本文へ返す。"""
+    p = RB.parse_chunk_output(SPILL)
+    assert p.get("spilled"), "★戻した行数を記録していない"
+    assert p["spilled"] >= 4
+
+
+def test_章の項目名でも本文と分かる():
+    """★見出しが無くても、章の項目名が出たら本文。"""
+    p = RB.parse_chunk_output(
+        "### 【章】\n本文\n\n<<<用語の訂正>>>\n公権 → 後見\n"
+        "**講師が述べた根拠・理由**\n理由の本文\n")
+    assert p["terms"] == ["公権 → 後見"]
+    assert "理由の本文" in p["chapters"]
+
+
+def test_仕掛けを外すと流れ込む():
+    """★いま防げているのは仕掛けのおかげ、の裏取り。"""
+    assert RB._looks_like_body("**何が変わるのか／何が論点か**")
+    assert not RB._looks_like_body("公権 → 後見")
+    assert RB._HEADING.match("### 【章B】")
+
+
+def test_正しい件数になること():
+    """★件数が嘘にならないこと。"""
+    p = RB.parse_chunk_output(SPILL)
+    md = RB.publicity_section(p["publicity"])
+    assert "★1件" in md, md.split("\n")[2]

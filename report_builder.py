@@ -356,6 +356,16 @@ _HEADER_WORDS = ("明確 or 推定", "直す前 → 直した後", "直す前 �
                  "法令名 | 条", "事項 | 値")
 
 
+#: ★一覧の中に本文が混ざったことを見分ける手がかり。
+#  章の項目名が出てきたら、そこから先は一覧ではなく本文。
+_BODY_MARKS = ("**何が変わるのか", "**講師が述べた根拠", "**実務でどう効くか",
+               "**講師が示した具体例", "**言い切られていないこと**")
+
+
+def _looks_like_body(t: str) -> bool:
+    return any(t.startswith(w) for w in _BODY_MARKS)
+
+
 def _is_header_row(t: str) -> bool:
     return any(w in t for w in _HEADER_WORDS)
 
@@ -391,17 +401,33 @@ def parse_chunk_output(text: str) -> dict:
     for i, (p, m) in enumerate(pos):
         end = pos[i + 1][0] if i + 1 < len(pos) else len(s)
         body = s[p + len(m):end]
-        rows = []
+        rows, spilled = [], []
+        back_to_body = False
         for line in body.splitlines():
             t = line.strip().lstrip("-・ ").strip()
-            if not t or t.startswith("|--") or t in ("なし", "（なし）"):
-                continue
             if t.startswith("|"):
                 t = t.strip("|").strip()
+            # ★2026-08-21: 印より後ろに章が戻ってきたら、そこから先は★本文に返す。
+            #   実測: 最後の区画が <<<公表状態>>> の後ろに章を書き、
+            #   その5章ぶん62行が「公的な裏付けが無い箇所」の表に流れ込み、
+            #   件数が 4件 → ★66件 と表示された。
+            #   ★一覧に本文が混ざると、件数が嘘になるうえ、本編から章が消える。
+            if back_to_body or _HEADING.match(t) or _looks_like_body(t):
+                back_to_body = True
+                spilled.append(line)
+                continue
+            if not t or t.startswith("|--") or t in ("なし", "（なし）"):
+                continue
             if _is_header_row(t) or _is_noop_correction(t):
                 continue          # ★見出しの写しと、直していない行は落とす
             rows.append(t)
         out[key[m]] = rows
+        if spilled:
+            # ★捨てない。本文へ戻す（勝手に消さない）。
+            out["chapters"] = (out["chapters"] + "\n\n"
+                               + "\n".join(spilled)).strip()
+            out.setdefault("spilled", 0)
+            out["spilled"] += len(spilled)
     return out
 
 

@@ -102,7 +102,17 @@ if "results" not in st.session_state:
     st.session_state.results = []
 
 # Notion設定（環境変数から読み込み）
-NOTION_API_KEY     = os.environ.get("NOTION_API_KEY", "")
+# ★2026-08-21: 名前を NOTION_TOKEN に揃えた。
+#   それまで NOTION_API_KEY だけを探しており、共有の .env に在るのは
+#   ★NOTION_TOKEN なので、画面に「NOTION_API_KEY 未設定」と出て
+#   研修DBに登録できなかった。
+#   実測: .env の Notion 系のキー名は NOTION_TOKEN と各DBのIDのみ。
+#         NOTION_API_KEY という名前は★存在しない。
+#   他のシステム（voice_report_batch / kenshu_to_dify_layer3 / bot）は
+#   すべて NOTION_TOKEN を使っている。★このアプリだけが違っていた。
+#   ★古い名前も残して読む（どちらでも動く。移行中に壊さないため）。
+NOTION_API_KEY     = (os.environ.get("NOTION_TOKEN", "")
+                      or os.environ.get("NOTION_API_KEY", ""))
 NOTION_DB_KENSHU   = os.environ.get("NOTION_DB_ID_KENSHU", "475162c3cf1f4993a9b231e202ec40fb")
 
 
@@ -767,7 +777,7 @@ def save_to_notion_kenshu(
     attachment_file_info: list = None,
 ) -> bool:
     if not NOTION_API_KEY:
-        st.error("⚠️ NOTION_API_KEY が未設定です。環境変数を確認してください。")
+        st.error("⚠️ NOTION_TOKEN が未設定です。OneDrive の secrets フォルダにある .env を確認してください。")
         return False
 
     headers = {
@@ -1532,7 +1542,7 @@ with st.sidebar:
     if NOTION_API_KEY:
         st.success("✓ Notion APIキー設定済み")
     else:
-        st.warning("⚠️ NOTION_API_KEY 未設定（Notion保存不可）")
+        st.warning("⚠️ NOTION_TOKEN 未設定（Notion保存不可）")
 
     st.divider()
     st.markdown(r"""
