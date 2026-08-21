@@ -121,6 +121,15 @@ https://developers.openai.com/api/docs/pricing を実際に読んだ値（2026-0
   音の途切れは `report_builder.silent_gaps()` が機械的に拾い、
   「聞き取れなかった箇所」としてレポートに載る
 
+### 作ったレポートを Dify に入れるには
+
+このアプリは**レポートを作るところまで**です。Dify に入れる手順は
+`C:\dev\ohga-office\README.md` に書いてあります。
+
+- 講演・研修の記録 → 同ファイルの「経路5」
+- 案件のレポート → 同ファイルの「経路4」
+  （★2026-08-21 時点で、経路4は最後まで通せません。理由も同ファイルに書いてあります）
+
 ### 生存確認
 
 `dev-tools/tests/test_voice_memo_shared_lib.py` が★実際にアプリを起動して
